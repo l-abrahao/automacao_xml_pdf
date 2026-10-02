@@ -1,36 +1,31 @@
 import os
 import re
-import unicodedata
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import datetime
 
-import openpyxl
+from openpyxl import load_workbook
 from pypdf import PdfReader
 
 
 # ============================================================
-# CONFIGURAÇÕES
+# CONFIGURAÇÃO
 # ============================================================
 
 PASTA_PROCESSAR = Path("A_PROCESSAR")
 ARQUIVO_BANCO = Path("banco.xlsx")
-ARQUIVO_RELATORIO = Path("relatorio_xml_pdf_v7.txt")
+ARQUIVO_RELATORIO = Path("relatorio_xml_pdf_v8.txt")
 
 
 # ============================================================
-# FUNÇÕES BÁSICAS
+# UTILITÁRIOS
 # ============================================================
 
-def normalizar_cnpj(valor):
+def limpar_cnpj(valor):
     if valor is None:
         return ""
 
-    valor = str(valor).strip()
-
-    # Evita transformar 126.0 em algo estranho quando usado
-    # somente para exibição de código.
-    return re.sub(r"\D", "", valor)
+    return re.sub(r"\D", "", str(valor))
 
 
 def formatar_codigo(valor):
@@ -45,262 +40,783 @@ def formatar_codigo(valor):
     return texto
 
 
-def normalizar_texto(valor):
+def limpar_numero(valor):
     if valor is None:
-        return ""
-
-    texto = str(valor)
-
-    texto = unicodedata.normalize("NFKD", texto)
-    texto = "".join(
-        c for c in texto
-        if not unicodedata.combining(c)
-    )
-
-    texto = texto.upper()
-
-    return texto
-
-
-def somente_digitos(valor):
-    if valor is None:
-        return ""
-
-    return re.sub(r"\D", "", str(valor))
-
-
-# ============================================================
-# XML
-# ============================================================
-
-def ler_xml(caminho):
-    try:
-        return ET.parse(caminho)
-    except Exception as e:
         return None
+
+    texto = str(valor).strip()
+    texto = texto.replace(" ", "")
+
+    numeros = re.sub(r"\D", "", texto)
+
+    if not numeros:
+        return None
+
+    if len(numeros) > 12:
+        return None
+
+    return numeros.lstrip("0") or "0"
 
 
 def nome_tag(tag):
-    """
-    Remove namespace:
-    {http://...}nNF -> nNF
-    """
-    if "}" in tag:
-        return tag.split("}", 1)[1]
-
-    return tag
-
-
-def encontrar_elementos(root, nome):
-    resultado = []
-
-    for elem in root.iter():
-        if nome_tag(elem.tag).lower() == nome.lower():
-            resultado.append(elem)
-
-    return resultado
-
-
-def primeiro_texto(root, nomes):
-    nomes = {x.lower() for x in nomes}
-
-    for elem in root.iter():
-        if nome_tag(elem.tag).lower() in nomes:
-            if elem.text and elem.text.strip():
-                return elem.text.strip()
-
-    return ""
-
-
-def identificar_tipo_xml(root):
-    tags = set()
-
-    for elem in root.iter():
-        tags.add(nome_tag(elem.tag).lower())
-
-    # NFS-e
-    if (
-        "nfse" in tags
-        or "infnfse" in tags
-        or "nnfse" in tags
-        or "vissqn" in tags
-    ):
-        return "NFS-e"
-
-    # NF-e
-    if "infnfe" in tags or "nfe" in tags:
-        return "NF-e"
-
-    return "DESCONHECIDO"
-
-
-def extrair_numero_xml(root, tipo):
-    if tipo == "NF-e":
-        numero = primeiro_texto(root, ["nNF"])
-
-        if numero:
-            return numero
-
+    if not tag:
         return ""
 
-    if tipo == "NFS-e":
-        numero = primeiro_texto(
-            root,
-            [
-                "nNFSe",
-                "numero",
-                "Numero",
-                "NumeroNota",
-                "numeroNfse",
-            ]
+    return tag.split("}")[-1].strip()
+
+
+def normalizar_data(valor):
+    if not valor:
+        return None
+
+    texto = str(valor).strip()
+
+    formatos = [
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%d",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+    ]
+
+    for formato in formatos:
+        try:
+            dt = datetime.strptime(texto[:26], formato)
+            return dt.strftime("%d/%m/%Y")
+        except Exception:
+            pass
+
+    m = re.search(
+        r"(\d{2})[/-](\d{2})[/-](\d{4})",
+        texto
+    )
+
+    if m:
+        return (
+            f"{m.group(1)}/"
+            f"{m.group(2)}/"
+            f"{m.group(3)}"
         )
 
-        return numero
+    m = re.search(
+        r"(\d{4})-(\d{2})-(\d{2})",
+        texto
+    )
 
-    return ""
-
-
-def extrair_data_xml(root):
-    candidatos = []
-
-    for elem in root.iter():
-        tag = nome_tag(elem.tag).lower()
-
-        if tag in {
-            "dhemi",
-            "demi",
-            "dataemissao",
-            "dataemissao",
-            "dhprocessamento",
-        }:
-            if elem.text and elem.text.strip():
-                candidatos.append(elem.text.strip())
-
-    for valor in candidatos:
-        # ISO:
-        # 2026-08-25T10:20:30-03:00
-        m = re.search(
-            r"(\d{4})-(\d{2})-(\d{2})",
-            valor
+    if m:
+        return (
+            f"{m.group(3)}/"
+            f"{m.group(2)}/"
+            f"{m.group(1)}"
         )
-
-        if m:
-            try:
-                return datetime.strptime(
-                    m.group(0),
-                    "%Y-%m-%d"
-                )
-            except Exception:
-                pass
-
-        # BR:
-        m = re.search(
-            r"(\d{2})/(\d{2})/(\d{4})",
-            valor
-        )
-
-        if m:
-            try:
-                return datetime.strptime(
-                    m.group(0),
-                    "%d/%m/%Y"
-                )
-            except Exception:
-                pass
 
     return None
 
 
-def extrair_cnpj_por_contexto(root, contexto):
+# ============================================================
+# CHAVES DE ACESSO
+# ============================================================
+
+def encontrar_chaves(texto):
     """
-    Procura CNPJ dentro de emit/dest.
+    Procura chaves de acesso de 44 dígitos.
+
+    Aceita:
+    - chave contínua
+    - chave separada por espaços
     """
 
-    for elem in root.iter():
+    if not texto:
+        return []
 
-        if nome_tag(elem.tag).lower() != contexto.lower():
-            continue
+    texto = str(texto)
 
-        for filho in elem.iter():
+    encontrados = set()
 
-            if nome_tag(filho.tag).lower() == "cnpj":
+    # Chave contínua
+    for chave in re.findall(
+        r"\b\d{44}\b",
+        texto
+    ):
+        encontrados.add(chave)
 
-                if filho.text:
-                    cnpj = normalizar_cnpj(filho.text)
+    # Chave com espaços
+    grupos = re.findall(
+        r"(?:\d{4}\s*){11}",
+        texto
+    )
+
+    for grupo in grupos:
+
+        chave = re.sub(
+            r"\D",
+            "",
+            grupo
+        )
+
+        if len(chave) == 44:
+            encontrados.add(chave)
+
+    return sorted(encontrados)
+
+
+def validar_chave_nfe(chave):
+    """
+    Validação estrutural básica.
+
+    A posição do modelo deve ser 55.
+    """
+
+    if not chave:
+        return False
+
+    if len(chave) != 44:
+        return False
+
+    if not chave.isdigit():
+        return False
+
+    modelo = chave[20:22]
+
+    if modelo != "55":
+        return False
+
+    return True
+
+
+def numero_por_chave_nfe(chave):
+    """
+    Extrai o número da NF-e da chave de acesso.
+
+    Estrutura da chave:
+
+    cUF
+    AAMM
+    CNPJ
+    modelo
+    série
+    número
+    etc.
+
+    O número da NF-e ocupa as posições 25:34.
+    """
+
+    if not validar_chave_nfe(chave):
+        return None
+
+    numero = chave[25:34]
+
+    if not numero.isdigit():
+        return None
+
+    numero = numero.lstrip("0")
+
+    return numero or "0"
+
+
+# ============================================================
+# LEITURA DO XML
+# ============================================================
+
+def ler_xml(caminho):
+    try:
+        tree = ET.parse(caminho)
+        root = tree.getroot()
+
+        return root
+
+    except Exception:
+        return None
+
+
+def todos_elementos(root):
+
+    if root is None:
+        return []
+
+    return list(root.iter())
+
+
+def extrair_textos_xml(root):
+
+    dados = []
+
+    for elem in todos_elementos(root):
+
+        tag = nome_tag(elem.tag)
+        texto = (elem.text or "").strip()
+
+        if texto:
+
+            dados.append({
+                "tag": tag,
+                "texto": texto
+            })
+
+        for chave, valor in elem.attrib.items():
+
+            if valor:
+
+                dados.append({
+                    "tag": chave,
+                    "texto": str(valor).strip()
+                })
+
+    return dados
+
+
+# ============================================================
+# IDENTIFICAÇÃO DO TIPO
+# ============================================================
+
+def identificar_tipo_xml(root):
+
+    if root is None:
+        return None
+
+    tags = {
+        nome_tag(elem.tag)
+        for elem in todos_elementos(root)
+    }
+
+    # NF-e
+    if (
+        "infNFe" in tags
+        or "NFe" in tags
+    ):
+        return "NF-e"
+
+    # NFS-e
+    if (
+        "NFSe" in tags
+        or "infNFSe" in tags
+        or "nNFSe" in tags
+        or "vISSQN" in tags
+    ):
+        return "NFS-e"
+
+    # Procura modelo 55
+    for elem in todos_elementos(root):
+
+        tag = nome_tag(elem.tag)
+
+        if tag.lower() == "mod":
+
+            texto = (
+                elem.text or ""
+            ).strip()
+
+            if texto == "55":
+                return "NF-e"
+
+    return None
+
+
+# ============================================================
+# NÚMERO DA NF — EXTRAÇÃO REDUNDANTE
+# ============================================================
+
+def candidatos_numero_xml(
+    root,
+    tipo,
+    caminho_xml
+):
+
+    candidatos = []
+
+    dados = extrair_textos_xml(root)
+
+    # --------------------------------------------------------
+    # MÉTODO 1 — TAGS EXATAS
+    # --------------------------------------------------------
+
+    if tipo == "NF-e":
+
+        tags_prioritarias = [
+            "nNF",
+            "numeroNF",
+            "numNF",
+            "numero",
+            "Numero",
+            "numeroNota",
+            "NumeroNota",
+        ]
+
+    elif tipo == "NFS-e":
+
+        tags_prioritarias = [
+            "nNFSe",
+            "NumeroNfse",
+            "NumeroNFSe",
+            "numero",
+            "Numero",
+            "numeroNota",
+            "NumeroNota",
+        ]
+
+    else:
+
+        tags_prioritarias = []
+
+    for item in dados:
+
+        if item["tag"] in tags_prioritarias:
+
+            numero = limpar_numero(
+                item["texto"]
+            )
+
+            if numero:
+
+                candidatos.append({
+                    "numero": numero,
+                    "metodo": (
+                        f"tag:{item['tag']}"
+                    ),
+                    "peso": 100
+                })
+
+    # --------------------------------------------------------
+    # MÉTODO 2 — TAGS INDICATIVAS
+    # --------------------------------------------------------
+
+    palavras_numero = [
+        "nnf",
+        "nfse",
+        "numeronf",
+        "numeronota",
+        "numnf",
+        "numnota",
+        "notanumero",
+    ]
+
+    for item in dados:
+
+        tag_lower = (
+            item["tag"]
+            .lower()
+            .replace("_", "")
+        )
+
+        if any(
+            palavra in tag_lower
+            for palavra in palavras_numero
+        ):
+
+            numero = limpar_numero(
+                item["texto"]
+            )
+
+            if numero:
+
+                candidatos.append({
+                    "numero": numero,
+                    "metodo": (
+                        f"tag_indicativa:"
+                        f"{item['tag']}"
+                    ),
+                    "peso": 90
+                })
+
+    # --------------------------------------------------------
+    # MÉTODO 3 — CONTEXTO TEXTUAL
+    # --------------------------------------------------------
+
+    for item in dados:
+
+        texto = item["texto"]
+
+        padroes = [
+
+            r"(?:n[ºo°]?\s*\.?\s*"
+            r"(?:da\s*)?(?:nota|nf|nfe))"
+            r"\s*[:\-]?\s*(\d+)",
+
+            r"(?:nota\s*fiscal)"
+            r"\s*(?:n[ºo°]?)?"
+            r"\s*[:\-]?\s*(\d+)",
+
+            r"(?:n[ºo°]?\s*nfse)"
+            r"\s*[:\-]?\s*(\d+)",
+
+            r"(?:n[úu]mero)"
+            r"\s*(?:da\s*)?"
+            r"(?:nota|nf|nfse)"
+            r"\s*[:\-]?\s*(\d+)",
+        ]
+
+        for padrao in padroes:
+
+            m = re.search(
+                padrao,
+                texto,
+                re.IGNORECASE
+            )
+
+            if m:
+
+                numero = limpar_numero(
+                    m.group(1)
+                )
+
+                if numero:
+
+                    candidatos.append({
+                        "numero": numero,
+                        "metodo": "texto_contextual",
+                        "peso": 80
+                    })
+
+    # --------------------------------------------------------
+    # MÉTODO 4 — NOME DO ARQUIVO
+    # --------------------------------------------------------
+
+    nome = caminho_xml.name
+
+    padroes_nome = [
+
+        r"(?:NF|NFE|NFS|NFSE)"
+        r"[^\d]*(\d+)",
+
+        r"^(\d{1,12})",
+    ]
+
+    for padrao in padroes_nome:
+
+        m = re.search(
+            padrao,
+            nome,
+            re.IGNORECASE
+        )
+
+        if m:
+
+            numero = limpar_numero(
+                m.group(1)
+            )
+
+            if numero:
+
+                candidatos.append({
+                    "numero": numero,
+                    "metodo": "nome_arquivo",
+                    "peso": 60
+                })
+
+    # --------------------------------------------------------
+    # MÉTODO 5 — CHAVE DE ACESSO
+    # --------------------------------------------------------
+
+    # CORRIGIDO:
+    # anteriormente estava extrair_chaves()
+    # a função correta é encontrar_chaves()
+
+    texto_para_chaves = (
+        caminho_xml.stem
+        + " "
+        + " ".join(
+            item["texto"]
+            for item in dados
+        )
+    )
+
+    chaves = encontrar_chaves(
+        texto_para_chaves
+    )
+
+    for chave in chaves:
+
+        if (
+            tipo == "NF-e"
+            and validar_chave_nfe(chave)
+        ):
+
+            numero = numero_por_chave_nfe(
+                chave
+            )
+
+            if numero:
+
+                candidatos.append({
+                    "numero": numero,
+                    "metodo": "chave_acesso",
+                    "peso": 95,
+                    "chave": chave
+                })
+
+    return candidatos
+
+
+def decidir_numero_xml(
+    root,
+    tipo,
+    caminho_xml
+):
+
+    candidatos = candidatos_numero_xml(
+        root,
+        tipo,
+        caminho_xml
+    )
+
+    if not candidatos:
+
+        return (
+            None,
+            [],
+            "SEM_NÚMERO"
+        )
+
+    # --------------------------------------------------------
+    # AGRUPAMENTO
+    # --------------------------------------------------------
+
+    agrupados = {}
+
+    for candidato in candidatos:
+
+        numero = candidato["numero"]
+
+        if numero not in agrupados:
+            agrupados[numero] = []
+
+        agrupados[numero].append(
+            candidato
+        )
+
+    # --------------------------------------------------------
+    # RANKING
+    # --------------------------------------------------------
+
+    ranking = []
+
+    for numero, itens in agrupados.items():
+
+        peso_total = sum(
+            item["peso"]
+            for item in itens
+        )
+
+        ranking.append({
+
+            "numero": numero,
+
+            "peso": peso_total,
+
+            "metodos": [
+                item["metodo"]
+                for item in itens
+            ]
+        })
+
+    ranking.sort(
+        key=lambda x: x["peso"],
+        reverse=True
+    )
+
+    primeiro = ranking[0]
+
+    # --------------------------------------------------------
+    # CONFLITO
+    # --------------------------------------------------------
+
+    if len(ranking) > 1:
+
+        if (
+            ranking[0]["peso"]
+            == ranking[1]["peso"]
+        ):
+
+            return (
+                None,
+                candidatos,
+                "CONFLITO_NÚMEROS"
+            )
+
+    return (
+        primeiro["numero"],
+        candidatos,
+        primeiro["metodos"]
+    )
+
+
+# ============================================================
+# DATA DE EMISSÃO
+# ============================================================
+
+def extrair_data_xml(root):
+
+    if root is None:
+        return None
+
+    candidatos = []
+
+    tags_data = {
+        "dhEmi",
+        "dEmi",
+        "dhEmissao",
+        "dEmissao",
+        "dataEmissao",
+        "DataEmissao",
+        "dtEmissao",
+    }
+
+    for elem in todos_elementos(root):
+
+        tag = nome_tag(elem.tag)
+
+        if tag in tags_data:
+
+            texto = (
+                elem.text or ""
+            ).strip()
+
+            data = normalizar_data(
+                texto
+            )
+
+            if data:
+
+                candidatos.append(
+                    data
+                )
+
+    if candidatos:
+        return candidatos[0]
+
+    # Segunda tentativa
+    for elem in todos_elementos(root):
+
+        texto = (
+            elem.text or ""
+        ).strip()
+
+        data = normalizar_data(
+            texto
+        )
+
+        if data:
+            return data
+
+    return None
+
+
+# ============================================================
+# CNPJ DO EMITENTE / DESTINATÁRIO
+# ============================================================
+
+def extrair_emitente_destinatario(root):
+
+    emit_cnpj = None
+    dest_cnpj = None
+
+    for elem in todos_elementos(root):
+
+        tag = nome_tag(elem.tag)
+
+        # ----------------------------------------------------
+        # EMITENTE
+        # ----------------------------------------------------
+
+        if tag == "emit":
+
+            for filho in elem.iter():
+
+                if (
+                    nome_tag(filho.tag)
+                    == "CNPJ"
+                ):
+
+                    cnpj = limpar_cnpj(
+                        filho.text
+                    )
 
                     if len(cnpj) == 14:
-                        return cnpj
 
-    return ""
+                        emit_cnpj = cnpj
+
+                        break
+
+        # ----------------------------------------------------
+        # DESTINATÁRIO
+        # ----------------------------------------------------
+
+        if tag == "dest":
+
+            for filho in elem.iter():
+
+                if (
+                    nome_tag(filho.tag)
+                    == "CNPJ"
+                ):
+
+                    cnpj = limpar_cnpj(
+                        filho.text
+                    )
+
+                    if len(cnpj) == 14:
+
+                        dest_cnpj = cnpj
+
+                        break
+
+    return (
+        emit_cnpj,
+        dest_cnpj
+    )
 
 
-def extrair_emitente(root):
-    return extrair_cnpj_por_contexto(root, "emit")
+# ============================================================
+# CHAVE DO XML
+# ============================================================
 
+def extrair_chave_xml(
+    root,
+    caminho_xml
+):
 
-def extrair_destinatario(root):
-    return extrair_cnpj_por_contexto(root, "dest")
+    textos = []
 
+    if root is not None:
 
-def extrair_chave_xml(root, caminho):
-    """
-    Tenta obter a chave da NF-e de forma segura.
-    """
+        for elem in todos_elementos(root):
 
-    # --------------------------------------------------------
-    # 1. atributo Id de infNFe
-    # --------------------------------------------------------
+            texto = (
+                elem.text or ""
+            ).strip()
 
-    for elem in root.iter():
+            if texto:
+                textos.append(texto)
 
-        if nome_tag(elem.tag).lower() == "infnfe":
-
-            for chave_attr in ["Id", "id"]:
-
-                valor = elem.attrib.get(chave_attr)
+            for valor in elem.attrib.values():
 
                 if valor:
+                    textos.append(
+                        str(valor)
+                    )
 
-                    digitos = somente_digitos(valor)
-
-                    if len(digitos) == 44:
-                        return digitos
-
-    # --------------------------------------------------------
-    # 2. conteúdo XML com sequência de 44 dígitos
-    # --------------------------------------------------------
-
-    texto_xml = ""
-
-    try:
-        texto_xml = ET.tostring(
-            root,
-            encoding="unicode"
-        )
-    except Exception:
-        pass
-
-    encontrados = re.findall(
-        r"(?<!\d)\d{44}(?!\d)",
-        texto_xml
+    textos.append(
+        caminho_xml.name
     )
 
-    if encontrados:
-        return encontrados[0]
-
-    # --------------------------------------------------------
-    # 3. nome do arquivo
-    # --------------------------------------------------------
-
-    encontrados = re.findall(
-        r"(?<!\d)\d{44}(?!\d)",
-        caminho.stem
+    chaves = encontrar_chaves(
+        " ".join(textos)
     )
 
-    if encontrados:
-        return encontrados[0]
+    # Prioriza modelo 55
+    chaves_validas = [
+        chave
+        for chave in chaves
+        if validar_chave_nfe(chave)
+    ]
 
-    return ""
+    if chaves_validas:
+        return chaves_validas[0]
+
+    if chaves:
+        return chaves[0]
+
+    return None
 
 
 # ============================================================
@@ -309,66 +825,89 @@ def extrair_chave_xml(root, caminho):
 
 def carregar_clientes():
 
-    clientes = []
-
-    wb = openpyxl.load_workbook(
+    wb = load_workbook(
         ARQUIVO_BANCO,
         data_only=True
     )
 
     ws = wb.active
 
-    cabecalhos = {}
+    clientes = []
 
-    for col in range(1, ws.max_column + 1):
+    headers = {}
+
+    for coluna in range(
+        1,
+        ws.max_column + 1
+    ):
 
         valor = ws.cell(
             row=1,
-            column=col
+            column=coluna
         ).value
 
         if valor:
-            cabecalhos[
-                str(valor).strip().upper()
-            ] = col
 
-    col_cod = cabecalhos.get("COD")
-    col_razao = cabecalhos.get("RAZÃO SOCIAL")
-    col_cnpj = cabecalhos.get("CNPJ")
-    col_caminho = cabecalhos.get("CAMINHO ABSOLUTO")
+            headers[
+                str(valor)
+                .strip()
+                .upper()
+            ] = coluna
 
-    if not col_cnpj or not col_caminho:
-        raise Exception(
-            "O banco.xlsx precisa conter as colunas "
-            "'CNPJ' e 'CAMINHO ABSOLUTO'."
+    col_cod = headers.get("COD")
+    col_razao = headers.get(
+        "RAZÃO SOCIAL"
+    )
+    col_cnpj = headers.get("CNPJ")
+    col_caminho = headers.get(
+        "CAMINHO ABSOLUTO"
+    )
+
+    for linha in range(
+        2,
+        ws.max_row + 1
+    ):
+
+        cod = formatar_codigo(
+            ws.cell(
+                linha,
+                col_cod
+            ).value
         )
 
-    for linha in range(2, ws.max_row + 1):
+        razao = str(
+            ws.cell(
+                linha,
+                col_razao
+            ).value or ""
+        ).strip()
 
-        cnpj = ws.cell(
-            linha,
-            col_cnpj
-        ).value
+        cnpj = limpar_cnpj(
+            ws.cell(
+                linha,
+                col_cnpj
+            ).value
+        )
 
-        caminho = ws.cell(
-            linha,
-            col_caminho
-        ).value
+        caminho = str(
+            ws.cell(
+                linha,
+                col_caminho
+            ).value or ""
+        ).strip()
 
-        if not cnpj or not caminho:
+        if not cnpj:
             continue
 
         clientes.append({
-            "cod": formatar_codigo(
-                ws.cell(linha, col_cod).value
-                if col_cod else ""
-            ),
-            "razao": str(
-                ws.cell(linha, col_razao).value
-                if col_razao else ""
-            ).strip(),
-            "cnpj": normalizar_cnpj(cnpj),
-            "caminho": Path(str(caminho).strip()),
+
+            "cod": cod,
+
+            "razao": razao,
+
+            "cnpj": cnpj,
+
+            "caminho": Path(caminho)
         })
 
     return clientes
@@ -380,93 +919,111 @@ def carregar_clientes():
 
 def identificar_cliente(
     clientes,
-    emitente,
-    destinatario
+    emit_cnpj,
+    dest_cnpj
 ):
 
-    candidatos_entrada = []
-    candidatos_saida = []
-
-    for cliente in clientes:
-
-        cnpj_cliente = cliente["cnpj"]
-
-        if destinatario == cnpj_cliente:
-            candidatos_entrada.append(cliente)
-
-        if emitente == cnpj_cliente:
-            candidatos_saida.append(cliente)
+    resultados = []
 
     # --------------------------------------------------------
-    # Entrada
+    # DESTINATÁRIO = ENTRADA
     # --------------------------------------------------------
 
-    if len(candidatos_entrada) == 1:
-        return (
-            candidatos_entrada[0],
-            "ENTRADAS",
-            ""
-        )
+    if dest_cnpj:
 
-    if len(candidatos_entrada) > 1:
+        for cliente in clientes:
+
+            if (
+                cliente["cnpj"]
+                == dest_cnpj
+            ):
+
+                resultados.append(
+                    (
+                        "ENTRADAS",
+                        cliente
+                    )
+                )
+
+    if len(resultados) == 1:
+        return resultados[0]
+
+    if len(resultados) > 1:
+
         return (
-            None,
-            "",
-            "CNPJ do destinatário encontrado em mais de um cliente"
+            "AMBIGUO",
+            resultados
         )
 
     # --------------------------------------------------------
-    # Saída
+    # EMITENTE = SAÍDA
     # --------------------------------------------------------
 
-    if len(candidatos_saida) == 1:
+    resultados = []
+
+    if emit_cnpj:
+
+        for cliente in clientes:
+
+            if (
+                cliente["cnpj"]
+                == emit_cnpj
+            ):
+
+                resultados.append(
+                    (
+                        "SAIDAS",
+                        cliente
+                    )
+                )
+
+    if len(resultados) == 1:
+        return resultados[0]
+
+    if len(resultados) > 1:
+
         return (
-            candidatos_saida[0],
-            "SAIDAS",
-            ""
+            "AMBIGUO",
+            resultados
         )
 
-    if len(candidatos_saida) > 1:
-        return (
-            None,
-            "",
-            "CNPJ do emitente encontrado em mais de um cliente"
-        )
-
-    return (
-        None,
-        "",
-        "CNPJ do emitente/destinatário não encontrado no banco.xlsx"
-    )
+    return None
 
 
 # ============================================================
-# DESTINO
+# PASTA DE DESTINO
 # ============================================================
 
-def montar_destino(cliente, direcao, data):
+def pasta_destino(
+    cliente,
+    data,
+    direcao
+):
 
-    if not cliente or not data:
+    if not data:
         return None
 
-    ano = str(data.year)
+    try:
 
-    mes = f"{data.month:02d}"
-    ano_curto = str(data.year)[-2:]
+        dia, mes, ano = data.split("/")
 
-    pasta_mes = f"{mes}-{ano_curto}"
+        ano_curto = ano[-2:]
 
-    return (
-        cliente["caminho"]
-        / "NF"
-        / direcao
-        / ano
-        / pasta_mes
-    )
+        pasta = (
+            cliente["caminho"]
+            / "NF"
+            / direcao
+            / f"{mes}-{ano_curto}"
+        )
+
+        return pasta
+
+    except Exception:
+        return None
 
 
 # ============================================================
-# PDF
+# PDF — LEITURA
 # ============================================================
 
 def extrair_texto_pdf(caminho):
@@ -475,18 +1032,24 @@ def extrair_texto_pdf(caminho):
 
     try:
 
-        reader = PdfReader(str(caminho))
+        reader = PdfReader(
+            str(caminho)
+        )
 
         for pagina in reader.pages:
 
             try:
-                texto = pagina.extract_text()
+
+                texto = (
+                    pagina.extract_text()
+                    or ""
+                )
 
                 if texto:
                     textos.append(texto)
 
             except Exception:
-                continue
+                pass
 
     except Exception:
         return ""
@@ -494,828 +1057,916 @@ def extrair_texto_pdf(caminho):
     return "\n".join(textos)
 
 
-def normalizar_texto_pdf(texto):
-
-    if not texto:
-        return ""
-
-    texto = texto.replace("\xa0", " ")
-
-    texto = unicodedata.normalize(
-        "NFKC",
-        texto
-    )
-
-    return texto
-
-
-def extrair_chaves_pdf(texto):
-
-    if not texto:
-        return []
-
-    texto = normalizar_texto_pdf(texto)
-
-    encontrados = set()
-
-    # --------------------------------------------------------
-    # Forma 1:
-    # 44 dígitos contínuos
-    # --------------------------------------------------------
-
-    for chave in re.findall(
-        r"(?<!\d)\d{44}(?!\d)",
-        texto
-    ):
-        encontrados.add(chave)
-
-    # --------------------------------------------------------
-    # Forma 2:
-    # chave separada por espaços
-    #
-    # Exemplo:
-    # 35 2608 5824 8352 ...
-    # --------------------------------------------------------
-
-    linhas = texto.splitlines()
-
-    for linha in linhas:
-
-        digitos = somente_digitos(linha)
-
-        if len(digitos) == 44:
-            encontrados.add(digitos)
-
-    # --------------------------------------------------------
-    # Forma 3:
-    # grupos separados por espaços
-    #
-    # Procuramos grupos que, juntos, formem 44 dígitos.
-    # --------------------------------------------------------
-
-    grupos = re.findall(
-        r"(?:\d[\s]*){44}",
-        texto
-    )
-
-    for grupo in grupos:
-
-        digitos = somente_digitos(grupo)
-
-        if len(digitos) == 44:
-            encontrados.add(digitos)
-
-    return list(encontrados)
-
+# ============================================================
+# PDF — NÚMEROS
+# ============================================================
 
 def extrair_numeros_pdf(texto):
-
-    if not texto:
-        return []
-
-    texto = normalizar_texto_pdf(texto)
 
     candidatos = []
 
     padroes = [
-        r"\bN[º°o]?\s*F\s*[-.]?\s*E?\s*[:#]?\s*(\d{1,9})\b",
-        r"\bNF[-\s]?[Ee]\s*[:#]?\s*(\d{1,9})\b",
-        r"\bN[úu]mero\s+(?:da\s+)?(?:NF|NFe|NFS-e|NFS)\s*[:#]?\s*(\d{1,9})\b",
-        r"\bNFS[-\s]?e\s*[:#]?\s*(\d{1,9})\b",
-        r"\bNFS\s*[:#]?\s*(\d{1,9})\b",
+
+        r"(?:NF[\s\-]?e|NFe|NF)"
+        r"[^\d]{0,20}"
+        r"(\d{1,12})",
+
+        r"(?:NFS[\s\-]?e|NFSe|NFS)"
+        r"[^\d]{0,20}"
+        r"(\d{1,12})",
+
+        r"(?:Número|Numero|Nº|No)"
+        r"[^\d]{0,20}"
+        r"(\d{1,12})",
+
+        r"(?:Nota Fiscal)"
+        r"[^\d]{0,20}"
+        r"(\d{1,12})",
     ]
 
     for padrao in padroes:
 
-        encontrados = re.findall(
+        for m in re.finditer(
             padrao,
             texto,
-            flags=re.IGNORECASE
-        )
+            re.IGNORECASE
+        ):
 
-        for numero in encontrados:
+            numero = limpar_numero(
+                m.group(1)
+            )
 
-            if numero not in candidatos:
-                candidatos.append(numero)
+            if numero:
 
-    return candidatos
+                candidatos.append(
+                    numero
+                )
 
-
-def extrair_cnpj_pdf(texto):
-
-    if not texto:
-        return []
-
-    texto = normalizar_texto_pdf(texto)
-
-    encontrados = set()
-
-    # CNPJ formatado
-    for cnpj in re.findall(
-        r"\b\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}\b",
-        texto
-    ):
-        encontrados.add(
-            somente_digitos(cnpj)
-        )
-
-    # CNPJ sem máscara
-    for cnpj in re.findall(
-        r"(?<!\d)\d{14}(?!\d)",
-        texto
-    ):
-        encontrados.add(cnpj)
-
-    return list(encontrados)
-
-
-def extrair_data_pdf(texto):
-
-    if not texto:
-        return []
-
-    texto = normalizar_texto_pdf(texto)
-
-    datas = []
-
-    for data in re.findall(
-        r"\b\d{2}/\d{2}/\d{4}\b",
-        texto
-    ):
-
-        if data not in datas:
-            datas.append(data)
-
-    return datas
+    return sorted(
+        set(candidatos)
+    )
 
 
 # ============================================================
-# ÍNDICE DOS PDFs
+# PDF — CNPJs
+# ============================================================
+
+def extrair_cnpjs_pdf(texto):
+
+    encontrados = set()
+
+    for numero in re.findall(
+        r"\d[\d./-]{12,20}\d",
+        texto
+    ):
+
+        cnpj = limpar_cnpj(
+            numero
+        )
+
+        if len(cnpj) == 14:
+
+            encontrados.add(
+                cnpj
+            )
+
+    return sorted(
+        encontrados
+    )
+
+
+# ============================================================
+# PDF — INDEXAÇÃO
 # ============================================================
 
 def indexar_pdfs():
 
     indice = []
 
-    arquivos = sorted(
-        PASTA_PROCESSAR.glob("*.pdf")
-    )
+    for caminho in PASTA_PROCESSAR.glob(
+        "*.pdf"
+    ):
 
-    for pdf in arquivos:
-
-        texto = extrair_texto_pdf(pdf)
-
-        chaves = extrair_chaves_pdf(texto)
-        numeros = extrair_numeros_pdf(texto)
-        cnpjs = extrair_cnpj_pdf(texto)
-        datas = extrair_data_pdf(texto)
-
-        # Também procura chave no nome do arquivo
-        chaves_nome = re.findall(
-            r"(?<!\d)\d{44}(?!\d)",
-            pdf.stem
+        texto = extrair_texto_pdf(
+            caminho
         )
 
-        for chave in chaves_nome:
-            if chave not in chaves:
-                chaves.append(chave)
+        # ----------------------------------------------------
+        # CHAVES
+        # ----------------------------------------------------
+
+        chaves = encontrar_chaves(
+            texto
+            + " "
+            + caminho.stem
+        )
+
+        # ----------------------------------------------------
+        # NÚMEROS
+        # ----------------------------------------------------
+
+        numeros = extrair_numeros_pdf(
+            texto
+        )
+
+        # ----------------------------------------------------
+        # CNPJs
+        # ----------------------------------------------------
+
+        cnpjs = extrair_cnpjs_pdf(
+            texto
+        )
+
+        # ----------------------------------------------------
+        # DATAS
+        # ----------------------------------------------------
+
+        datas = []
+
+        for m in re.finditer(
+            r"\b\d{2}/\d{2}/\d{4}\b",
+            texto
+        ):
+
+            datas.append(
+                m.group(0)
+            )
 
         indice.append({
-            "arquivo": pdf,
+
+            "arquivo": caminho,
+
             "texto": texto,
+
             "chaves": chaves,
+
             "numeros": numeros,
+
             "cnpjs": cnpjs,
-            "datas": datas,
+
+            "datas": sorted(
+                set(datas)
+            ),
+
+            "usado": False
         })
 
     return indice
 
 
 # ============================================================
-# ASSOCIAÇÃO XML ↔ PDF
+# ASSOCIAR PDF
 # ============================================================
 
 def associar_pdf(
-    registro_xml,
-    indice_pdfs,
+    xml_info,
+    pdfs
 ):
 
-    chave_xml = registro_xml["chave"]
-    numero_xml = registro_xml["numero"]
-    tipo_xml = registro_xml["tipo"]
-
-    candidatos = []
+    chave = xml_info["chave"]
+    numero = xml_info["numero"]
 
     # --------------------------------------------------------
-    # 1. Correspondência EXATA pela chave
+    # 1 — CHAVE EXATA
     # --------------------------------------------------------
 
-    if chave_xml:
+    if chave:
 
-        for pdf in indice_pdfs:
+        encontrados = []
 
-            if chave_xml in pdf["chaves"]:
+        for pdf in pdfs:
 
-                candidatos.append({
-                    "pdf": pdf,
-                    "metodo": "CHAVE EXATA"
-                })
+            if pdf["usado"]:
+                continue
+
+            if chave in pdf["chaves"]:
+
+                encontrados.append(
+                    pdf
+                )
+
+        if len(encontrados) == 1:
+
+            pdf = encontrados[0]
+
+            pdf["usado"] = True
+
+            return (
+                pdf,
+                "CHAVE_EXATA"
+            )
+
+        if len(encontrados) > 1:
+
+            return (
+                None,
+                "CONFLITO_CHAVE"
+            )
+
+    # --------------------------------------------------------
+    # 2 — NÚMERO EXATO
+    # --------------------------------------------------------
+
+    if numero:
+
+        encontrados = []
+
+        for pdf in pdfs:
+
+            if pdf["usado"]:
+                continue
+
+            if numero in pdf["numeros"]:
+
+                encontrados.append(
+                    pdf
+                )
+
+        if len(encontrados) == 1:
+
+            pdf = encontrados[0]
+
+            pdf["usado"] = True
+
+            return (
+                pdf,
+                "NUMERO_EXATO"
+            )
+
+        if len(encontrados) > 1:
+
+            # Tenta resolver pelo CNPJ
+
+            cnpjs_xml = {
+                xml_info["emit_cnpj"],
+                xml_info["dest_cnpj"]
+            }
+
+            cnpjs_xml.discard(
+                None
+            )
+
+            filtrados = []
+
+            for pdf in encontrados:
+
+                if cnpjs_xml.intersection(
+                    set(pdf["cnpjs"])
+                ):
+
+                    filtrados.append(
+                        pdf
+                    )
+
+            if len(filtrados) == 1:
+
+                pdf = filtrados[0]
+
+                pdf["usado"] = True
+
+                return (
+                    pdf,
+                    "NUMERO_E_CNPJ"
+                )
+
+            return (
+                None,
+                "CONFLITO_NUMERO"
+            )
+
+    # --------------------------------------------------------
+    # 3 — CNPJ + DATA
+    # --------------------------------------------------------
+
+    cnpjs_xml = {
+        xml_info["emit_cnpj"],
+        xml_info["dest_cnpj"]
+    }
+
+    cnpjs_xml.discard(
+        None
+    )
+
+    if (
+        cnpjs_xml
+        and xml_info["data"]
+    ):
+
+        candidatos = []
+
+        for pdf in pdfs:
+
+            if pdf["usado"]:
+                continue
+
+            if not cnpjs_xml.intersection(
+                set(pdf["cnpjs"])
+            ):
+                continue
+
+            if (
+                xml_info["data"]
+                not in pdf["datas"]
+            ):
+                continue
+
+            candidatos.append(
+                pdf
+            )
 
         if len(candidatos) == 1:
-            return candidatos[0], ""
 
-        if len(candidatos) > 1:
-            return (
-                None,
-                "Mais de um PDF possui a mesma chave de acesso"
-            )
+            pdf = candidatos[0]
 
-    # --------------------------------------------------------
-    # 2. Tentativa pelo número + tipo
-    #
-    # Só fazemos isso quando houver exatamente UM candidato.
-    # --------------------------------------------------------
-
-    if numero_xml:
-
-        numero_limpo = somente_digitos(numero_xml)
-
-        candidatos_numero = []
-
-        for pdf in indice_pdfs:
-
-            for numero_pdf in pdf["numeros"]:
-
-                if somente_digitos(numero_pdf) == numero_limpo:
-
-                    candidatos_numero.append(pdf)
-                    break
-
-        if len(candidatos_numero) == 1:
+            pdf["usado"] = True
 
             return (
-                {
-                    "pdf": candidatos_numero[0],
-                    "metodo": "NÚMERO DO DOCUMENTO"
-                },
-                ""
-            )
-
-        if len(candidatos_numero) > 1:
-
-            # Não escolher no chute.
-            return (
-                None,
-                "Número encontrado em mais de um PDF"
+                pdf,
+                "CNPJ_DATA"
             )
 
     return (
         None,
-        "PDF correspondente não identificado"
+        "SEM_ASSOCIACAO"
     )
 
 
 # ============================================================
-# PROCESSAMENTO DOS XMLs
+# PROCESSAMENTO XML
 # ============================================================
 
-def processar_xmls(clientes, indice_pdfs):
-
-    registros = []
-
-    arquivos_xml = sorted(
-        PASTA_PROCESSAR.glob("*.xml")
-    )
-
-    for arquivo in arquivos_xml:
-
-        registro = {
-            "arquivo": arquivo,
-            "status": "REVISÃO",
-            "tipo": "",
-            "numero": "",
-            "data": None,
-            "chave": "",
-            "cliente": None,
-            "direcao": "",
-            "destino": None,
-            "nome_xml": "",
-            "pdf": None,
-            "nome_pdf": "",
-            "metodo_pdf": "",
-            "motivo": "",
-        }
-
-        arvore = ler_xml(arquivo)
-
-        if arvore is None:
-
-            registro["motivo"] = (
-                "Não foi possível ler o XML"
-            )
-
-            registros.append(registro)
-            continue
-
-        root = arvore.getroot()
-
-        tipo = identificar_tipo_xml(root)
-
-        registro["tipo"] = tipo
-
-        numero = extrair_numero_xml(
-            root,
-            tipo
-        )
-
-        registro["numero"] = numero
-
-        registro["data"] = extrair_data_xml(root)
-
-        registro["chave"] = extrair_chave_xml(
-            root,
-            arquivo
-        )
-
-        emitente = extrair_emitente(root)
-        destinatario = extrair_destinatario(root)
-
-        if tipo == "DESCONHECIDO":
-
-            registro["motivo"] = (
-                "Tipo de documento não identificado"
-            )
-
-            registros.append(registro)
-            continue
-
-        if not numero:
-
-            registro["motivo"] = (
-                f"{tipo} sem número identificável"
-            )
-
-            registros.append(registro)
-            continue
-
-        cliente, direcao, erro_cliente = identificar_cliente(
-            clientes,
-            emitente,
-            destinatario
-        )
-
-        if not cliente:
-
-            registro["motivo"] = erro_cliente
-
-            registros.append(registro)
-            continue
-
-        if not registro["data"]:
-
-            registro["motivo"] = (
-                "Data de emissão não identificada"
-            )
-
-            registros.append(registro)
-            continue
-
-        registro["cliente"] = cliente
-        registro["direcao"] = direcao
-
-        # ----------------------------------------------------
-        # Nome final
-        # ----------------------------------------------------
-
-        if tipo == "NF-e":
-
-            registro["nome_xml"] = (
-                f"NF {numero}.xml"
-            )
-
-        elif tipo == "NFS-e":
-
-            registro["nome_xml"] = (
-                f"NFS {numero}.xml"
-            )
-
-        registro["destino"] = montar_destino(
-            cliente,
-            direcao,
-            registro["data"]
-        )
-
-        # ----------------------------------------------------
-        # Associação do PDF
-        # ----------------------------------------------------
-
-        associacao, erro_pdf = associar_pdf(
-            registro,
-            indice_pdfs
-        )
-
-        if associacao:
-
-            pdf_info = associacao["pdf"]
-
-            registro["pdf"] = pdf_info["arquivo"]
-            registro["metodo_pdf"] = associacao["metodo"]
-
-            if tipo == "NF-e":
-
-                registro["nome_pdf"] = (
-                    f"NF {numero}.pdf"
-                )
-
-            elif tipo == "NFS-e":
-
-                registro["nome_pdf"] = (
-                    f"NFS {numero}.pdf"
-                )
-
-            registro["status"] = "OK"
-
-            registro["motivo"] = (
-                f"{tipo} identificada | "
-                f"PDF associado por {registro['metodo_pdf']}"
-            )
-
-        else:
-
-            registro["status"] = "OK"
-
-            registro["motivo"] = (
-                f"{tipo} identificada | "
-                f"{erro_pdf}"
-            )
-
-        registros.append(registro)
-
-    return registros
-
-
-# ============================================================
-# PDF ÓRFÃOS
-# ============================================================
-
-def identificar_pdfs_associados(registros):
-
-    associados = set()
-
-    for registro in registros:
-
-        if registro["pdf"]:
-
-            associados.add(
-                registro["pdf"].resolve()
-            )
-
-    return associados
-
-
-def listar_pdfs_orfaos(
-    indice_pdfs,
-    associados
+def processar_xml(
+    caminho_xml,
+    clientes,
+    pdfs
 ):
 
-    orfaos = []
+    root = ler_xml(
+        caminho_xml
+    )
 
-    for pdf in indice_pdfs:
+    if root is None:
 
-        caminho = pdf["arquivo"].resolve()
+        return {
 
-        if caminho not in associados:
+            "arquivo":
+                caminho_xml.name,
 
-            orfaos.append(pdf)
+            "status":
+                "REVISÃO",
 
-    return orfaos
+            "motivo":
+                "XML inválido ou ilegível"
+        }
+
+    # --------------------------------------------------------
+    # TIPO
+    # --------------------------------------------------------
+
+    tipo = identificar_tipo_xml(
+        root
+    )
+
+    if not tipo:
+
+        return {
+
+            "arquivo":
+                caminho_xml.name,
+
+            "status":
+                "REVISÃO",
+
+            "motivo":
+                "Tipo de documento não identificado"
+        }
+
+    # --------------------------------------------------------
+    # CHAVE
+    # --------------------------------------------------------
+
+    chave = extrair_chave_xml(
+        root,
+        caminho_xml
+    )
+
+    # --------------------------------------------------------
+    # NÚMERO
+    # --------------------------------------------------------
+
+    (
+        numero,
+        candidatos_numero,
+        metodo_numero
+    ) = decidir_numero_xml(
+        root,
+        tipo,
+        caminho_xml
+    )
+
+    # --------------------------------------------------------
+    # DATA
+    # --------------------------------------------------------
+
+    data = extrair_data_xml(
+        root
+    )
+
+    # --------------------------------------------------------
+    # CNPJs
+    # --------------------------------------------------------
+
+    (
+        emit_cnpj,
+        dest_cnpj
+    ) = extrair_emitente_destinatario(
+        root
+    )
+
+    # --------------------------------------------------------
+    # CLIENTE
+    # --------------------------------------------------------
+
+    resultado_cliente = identificar_cliente(
+        clientes,
+        emit_cnpj,
+        dest_cnpj
+    )
+
+    if resultado_cliente is None:
+
+        return {
+
+            "arquivo":
+                caminho_xml.name,
+
+            "tipo":
+                tipo,
+
+            "chave":
+                chave,
+
+            "numero":
+                numero,
+
+            "data":
+                data,
+
+            "emit_cnpj":
+                emit_cnpj,
+
+            "dest_cnpj":
+                dest_cnpj,
+
+            "status":
+                "REVISÃO",
+
+            "motivo":
+                "CNPJ do cliente não encontrado",
+
+            "candidatos_numero":
+                candidatos_numero
+        }
+
+    if resultado_cliente[0] == "AMBIGUO":
+
+        return {
+
+            "arquivo":
+                caminho_xml.name,
+
+            "tipo":
+                tipo,
+
+            "chave":
+                chave,
+
+            "numero":
+                numero,
+
+            "data":
+                data,
+
+            "emit_cnpj":
+                emit_cnpj,
+
+            "dest_cnpj":
+                dest_cnpj,
+
+            "status":
+                "REVISÃO",
+
+            "motivo":
+                "CNPJ associado a mais de um cliente",
+
+            "candidatos_numero":
+                candidatos_numero
+        }
+
+    direcao, cliente = resultado_cliente
+
+    # --------------------------------------------------------
+    # NÚMERO NÃO ENCONTRADO
+    # --------------------------------------------------------
+
+    if not numero:
+
+        return {
+
+            "arquivo":
+                caminho_xml.name,
+
+            "tipo":
+                tipo,
+
+            "chave":
+                chave,
+
+            "numero":
+                None,
+
+            "data":
+                data,
+
+            "emit_cnpj":
+                emit_cnpj,
+
+            "dest_cnpj":
+                dest_cnpj,
+
+            "cliente":
+                cliente,
+
+            "direcao":
+                direcao,
+
+            "status":
+                "REVISÃO",
+
+            "motivo":
+                metodo_numero,
+
+            "candidatos_numero":
+                candidatos_numero
+        }
+
+    # --------------------------------------------------------
+    # DATA NÃO ENCONTRADA
+    # --------------------------------------------------------
+
+    if not data:
+
+        return {
+
+            "arquivo":
+                caminho_xml.name,
+
+            "tipo":
+                tipo,
+
+            "chave":
+                chave,
+
+            "numero":
+                numero,
+
+            "data":
+                None,
+
+            "emit_cnpj":
+                emit_cnpj,
+
+            "dest_cnpj":
+                dest_cnpj,
+
+            "cliente":
+                cliente,
+
+            "direcao":
+                direcao,
+
+            "status":
+                "REVISÃO",
+
+            "motivo":
+                "Data de emissão não identificada",
+
+            "candidatos_numero":
+                candidatos_numero
+        }
+
+    # --------------------------------------------------------
+    # ASSOCIAR PDF
+    # --------------------------------------------------------
+
+    info = {
+
+        "chave":
+            chave,
+
+        "numero":
+            numero,
+
+        "data":
+            data,
+
+        "emit_cnpj":
+            emit_cnpj,
+
+        "dest_cnpj":
+            dest_cnpj
+    }
+
+    pdf, metodo_pdf = associar_pdf(
+        info,
+        pdfs
+    )
+
+    # --------------------------------------------------------
+    # DESTINO
+    # --------------------------------------------------------
+
+    pasta = pasta_destino(
+        cliente,
+        data,
+        direcao
+    )
+
+    # --------------------------------------------------------
+    # NOME
+    # --------------------------------------------------------
+
+    if tipo == "NF-e":
+
+        nome_base = (
+            f"NF {numero}"
+        )
+
+    else:
+
+        nome_base = (
+            f"NFS {numero}"
+        )
+
+    arquivos_finais = [
+        f"{nome_base}.xml"
+    ]
+
+    if pdf:
+
+        arquivos_finais.append(
+            f"{nome_base}.pdf"
+        )
+
+    # --------------------------------------------------------
+    # RESULTADO
+    # --------------------------------------------------------
+
+    return {
+
+        "arquivo":
+            caminho_xml.name,
+
+        "tipo":
+            tipo,
+
+        "chave":
+            chave,
+
+        "numero":
+            numero,
+
+        "data":
+            data,
+
+        "emit_cnpj":
+            emit_cnpj,
+
+        "dest_cnpj":
+            dest_cnpj,
+
+        "cliente":
+            cliente,
+
+        "direcao":
+            direcao,
+
+        "pasta":
+            pasta,
+
+        "nome_base":
+            nome_base,
+
+        "arquivos_finais":
+            arquivos_finais,
+
+        "pdf":
+            pdf,
+
+        "metodo_pdf":
+            metodo_pdf,
+
+        "status":
+            "OK",
+
+        "metodo_numero":
+            metodo_numero,
+
+        "candidatos_numero":
+            candidatos_numero
+    }
 
 
 # ============================================================
 # RELATÓRIO
 # ============================================================
 
-def escrever_linha(arquivo, texto=""):
-    arquivo.write(texto + "\n")
-
-
-def escrever_relatorio(
-    registros,
-    indice_pdfs,
-    pdfs_orfaos
+def escrever_resultado(
+    f,
+    resultado
 ):
 
-    xml_ok = sum(
-        1
-        for r in registros
-        if r["status"] == "OK"
+    f.write(
+        "\n"
+        + "=" * 90
+        + "\n"
     )
 
-    xml_revisao = sum(
-        1
-        for r in registros
-        if r["status"] == "REVISÃO"
+    f.write(
+        f"ARQUIVO XML: "
+        f"{resultado.get('arquivo')}\n"
     )
 
-    pares = sum(
-        1
-        for r in registros
-        if r["pdf"] is not None
+    f.write(
+        f"STATUS: "
+        f"{resultado.get('status')}\n"
     )
 
-    xml_sem_pdf = sum(
-        1
-        for r in registros
-        if r["pdf"] is None
+    if resultado.get("tipo"):
+
+        f.write(
+            f"TIPO: "
+            f"{resultado.get('tipo')}\n"
+        )
+
+    if resultado.get("numero"):
+
+        f.write(
+            f"NÚMERO: "
+            f"{resultado.get('numero')}\n"
+        )
+
+    if resultado.get("data"):
+
+        f.write(
+            f"DATA: "
+            f"{resultado.get('data')}\n"
+        )
+
+    if resultado.get("chave"):
+
+        f.write(
+            f"CHAVE: "
+            f"{resultado.get('chave')}\n"
+        )
+
+    if resultado.get("emit_cnpj"):
+
+        f.write(
+            f"EMITENTE: "
+            f"{resultado.get('emit_cnpj')}\n"
+        )
+
+    if resultado.get("dest_cnpj"):
+
+        f.write(
+            f"DESTINATÁRIO: "
+            f"{resultado.get('dest_cnpj')}\n"
+        )
+
+    cliente = resultado.get(
+        "cliente"
     )
 
-    with open(
-        ARQUIVO_RELATORIO,
-        "w",
-        encoding="utf-8"
-    ) as f:
+    if isinstance(
+        cliente,
+        dict
+    ):
 
-        escrever_linha(
-            f,
-            "=" * 80
+        f.write(
+            f"CLIENTE: "
+            f"{cliente.get('cod')} - "
+            f"{cliente.get('razao')}\n"
         )
 
-        escrever_linha(
-            f,
-            "RELATÓRIO DE SIMULAÇÃO - V7"
+        f.write(
+            f"CAMINHO: "
+            f"{cliente.get('caminho')}\n"
         )
 
-        escrever_linha(
-            f,
-            "=" * 80
+    if resultado.get("direcao"):
+
+        f.write(
+            f"DIREÇÃO: "
+            f"{resultado.get('direcao')}\n"
         )
 
-        escrever_linha(f)
+    if resultado.get(
+        "metodo_numero"
+    ):
 
-        escrever_linha(
-            f,
-            "ATENÇÃO: NENHUM ARQUIVO FOI "
-            "MOVIDO OU RENOMEADO."
+        f.write(
+            f"MÉTODO NÚMERO: "
+            f"{resultado.get('metodo_numero')}\n"
         )
 
-        escrever_linha(f)
+    if resultado.get(
+        "candidatos_numero"
+    ):
 
-        escrever_linha(
-            f,
-            f"XML processados: {len(registros)}"
+        f.write(
+            "CANDIDATOS DE NÚMERO:\n"
         )
 
-        escrever_linha(
-            f,
-            f"PDF encontrados: {len(indice_pdfs)}"
-        )
+        for candidato in (
+            resultado[
+                "candidatos_numero"
+            ]
+        ):
 
-        escrever_linha(
-            f,
-            f"XML OK: {xml_ok}"
-        )
-
-        escrever_linha(
-            f,
-            f"XML REVISÃO: {xml_revisao}"
-        )
-
-        escrever_linha(
-            f,
-            f"PARES XML + PDF: {pares}"
-        )
-
-        escrever_linha(
-            f,
-            f"XML SEM PDF: {xml_sem_pdf}"
-        )
-
-        escrever_linha(
-            f,
-            f"PDF ÓRFÃOS: {len(pdfs_orfaos)}"
-        )
-
-        escrever_linha(f)
-
-        escrever_linha(
-            f,
-            "-" * 80
-        )
-
-        escrever_linha(
-            f,
-            "DETALHAMENTO DOS XMLs"
-        )
-
-        escrever_linha(
-            f,
-            "-" * 80
-        )
-
-        for r in registros:
-
-            escrever_linha(f)
-
-            escrever_linha(
-                f,
-                f"XML: {r['arquivo'].name}"
+            f.write(
+                f"  - "
+                f"{candidato.get('numero')} "
+                f"| "
+                f"{candidato.get('metodo')} "
+                f"| "
+                f"peso="
+                f"{candidato.get('peso')}\n"
             )
 
-            escrever_linha(
-                f,
-                f"Status: {r['status']}"
-            )
+    if resultado.get("pdf"):
 
-            escrever_linha(
-                f,
-                f"Tipo: {r['tipo']}"
-            )
+        pdf = resultado["pdf"]
 
-            escrever_linha(
-                f,
-                f"Número: {r['numero'] or '?'}"
-            )
-
-            if r["data"]:
-
-                data_formatada = (
-                    r["data"].strftime("%d/%m/%Y")
-                )
-
-            else:
-
-                data_formatada = "?"
-
-            escrever_linha(
-                f,
-                f"Data: {data_formatada}"
-            )
-
-            escrever_linha(
-                f,
-                f"Chave: {r['chave'] or '?'}"
-            )
-
-            if r["cliente"]:
-
-                escrever_linha(
-                    f,
-                    f"Cliente: {r['cliente']['cod']}"
-                )
-
-                escrever_linha(
-                    f,
-                    f"Razão Social: "
-                    f"{r['cliente']['razao']}"
-                )
-
-            else:
-
-                escrever_linha(
-                    f,
-                    "Cliente: ?"
-                )
-
-            escrever_linha(
-                f,
-                f"Direção: {r['direcao'] or '?'}"
-            )
-
-            escrever_linha(
-                f,
-                f"Nome XML: "
-                f"{r['nome_xml'] or '?'}"
-            )
-
-            escrever_linha(
-                f,
-                f"PDF associado: "
-                f"{r['pdf'].name if r['pdf'] else '?'}"
-            )
-
-            escrever_linha(
-                f,
-                f"Método PDF: "
-                f"{r['metodo_pdf'] or '?'}"
-            )
-
-            escrever_linha(
-                f,
-                f"Nome PDF: "
-                f"{r['nome_pdf'] or '?'}"
-            )
-
-            escrever_linha(
-                f,
-                f"Destino: "
-                f"{r['destino'] if r['destino'] else '?'}"
-            )
-
-            escrever_linha(
-                f,
-                f"Motivo: {r['motivo']}"
-            )
-
-        # ----------------------------------------------------
-        # PDFs ÓRFÃOS
-        # ----------------------------------------------------
-
-        escrever_linha(f)
-
-        escrever_linha(
-            f,
-            "=" * 80
+        f.write(
+            f"PDF ASSOCIADO: "
+            f"{pdf['arquivo'].name}\n"
         )
 
-        escrever_linha(
-            f,
-            "PDFs ÓRFÃOS / NÃO ASSOCIADOS"
+        f.write(
+            f"MÉTODO PDF: "
+            f"{resultado.get('metodo_pdf')}\n"
         )
 
-        escrever_linha(
-            f,
-            "=" * 80
+    elif resultado.get(
+        "status"
+    ) == "OK":
+
+        f.write(
+            "PDF ASSOCIADO: "
+            "NÃO ENCONTRADO "
+            "(XML pode existir sozinho)\n"
         )
 
-        if not pdfs_orfaos:
+    if resultado.get("pasta"):
 
-            escrever_linha(
-                f,
-                "Nenhum PDF órfão."
+        f.write(
+            f"PASTA DESTINO: "
+            f"{resultado.get('pasta')}\n"
+        )
+
+    if resultado.get(
+        "nome_base"
+    ):
+
+        f.write(
+            f"NOME PADRONIZADO: "
+            f"{resultado.get('nome_base')}\n"
+        )
+
+    if resultado.get(
+        "arquivos_finais"
+    ):
+
+        f.write(
+            "ARQUIVOS FINAIS:\n"
+        )
+
+        for nome in resultado[
+            "arquivos_finais"
+        ]:
+
+            f.write(
+                f"  - {nome}\n"
             )
 
-        else:
+    if resultado.get(
+        "motivo"
+    ):
 
-            for pdf in pdfs_orfaos:
-
-                escrever_linha(f)
-
-                escrever_linha(
-                    f,
-                    f"PDF: {pdf['arquivo'].name}"
-                )
-
-                escrever_linha(
-                    f,
-                    "Chaves encontradas: "
-                    + (
-                        ", ".join(pdf["chaves"])
-                        if pdf["chaves"]
-                        else "nenhuma"
-                    )
-                )
-
-                escrever_linha(
-                    f,
-                    "Números encontrados: "
-                    + (
-                        ", ".join(pdf["numeros"])
-                        if pdf["numeros"]
-                        else "nenhum"
-                    )
-                )
-
-                escrever_linha(
-                    f,
-                    "CNPJs encontrados: "
-                    + (
-                        ", ".join(pdf["cnpjs"])
-                        if pdf["cnpjs"]
-                        else "nenhum"
-                    )
-                )
-
-                escrever_linha(
-                    f,
-                    "Datas encontradas: "
-                    + (
-                        ", ".join(pdf["datas"][:10])
-                        if pdf["datas"]
-                        else "nenhuma"
-                    )
-                )
-
-        escrever_linha(f)
-
-        escrever_linha(
-            f,
-            "=" * 80
-        )
-
-        escrever_linha(
-            f,
-            "FIM DA SIMULAÇÃO"
-        )
-
-        escrever_linha(
-            f,
-            "NENHUM ARQUIVO FOI ALTERADO."
-        )
-
-        escrever_linha(
-            f,
-            "=" * 80
+        f.write(
+            f"MOTIVO: "
+            f"{resultado.get('motivo')}\n"
         )
 
 
@@ -1325,14 +1976,32 @@ def escrever_relatorio(
 
 def main():
 
-    print("=" * 70)
-    print("PROCESSAMENTO XML + PDF NF-e / NFS-e - V7")
-    print("=" * 70)
+    print(
+        "=============================================="
+    )
+
+    print(
+        " PROCESSADOR XML + PDF "
+        "NF-e / NFS-e - V8"
+    )
+
+    print(
+        " MODO SIMULAÇÃO"
+    )
+
+    print(
+        "=============================================="
+    )
+
+    # --------------------------------------------------------
+    # VERIFICAÇÕES
+    # --------------------------------------------------------
 
     if not PASTA_PROCESSAR.exists():
 
         print(
-            f"\nERRO: pasta '{PASTA_PROCESSAR}' não encontrada."
+            f"Pasta não encontrada: "
+            f"{PASTA_PROCESSAR}"
         )
 
         return
@@ -1340,94 +2009,323 @@ def main():
     if not ARQUIVO_BANCO.exists():
 
         print(
-            f"\nERRO: arquivo '{ARQUIVO_BANCO}' não encontrado."
+            f"Banco não encontrado: "
+            f"{ARQUIVO_BANCO}"
         )
 
         return
 
-    print("\nCarregando banco.xlsx...")
+    # --------------------------------------------------------
+    # CLIENTES
+    # --------------------------------------------------------
 
-    try:
+    print(
+        "Carregando banco de clientes..."
+    )
 
-        clientes = carregar_clientes()
+    clientes = carregar_clientes()
 
-    except Exception as e:
+    print(
+        f"Clientes carregados: "
+        f"{len(clientes)}"
+    )
 
+    # --------------------------------------------------------
+    # XML
+    # --------------------------------------------------------
+
+    xmls = sorted(
+        PASTA_PROCESSAR.glob(
+            "*.xml"
+        )
+    )
+
+    # --------------------------------------------------------
+    # PDF
+    # --------------------------------------------------------
+
+    print(
+        "Indexando PDFs..."
+    )
+
+    pdfs = indexar_pdfs()
+
+    print(
+        f"PDFs encontrados: "
+        f"{len(pdfs)}"
+    )
+
+    # --------------------------------------------------------
+    # PROCESSAMENTO
+    # --------------------------------------------------------
+
+    resultados = []
+
+    for xml in xmls:
+
+        print()
         print(
-            f"\nERRO ao carregar banco.xlsx: {e}"
+            f"Processando XML: "
+            f"{xml.name}"
         )
 
-        return
+        resultado = processar_xml(
+            xml,
+            clientes,
+            pdfs
+        )
 
-    print(
-        f"Clientes carregados: {len(clientes)}"
+        resultados.append(
+            resultado
+        )
+
+    # --------------------------------------------------------
+    # PDFS ÓRFÃOS
+    # --------------------------------------------------------
+
+    pdfs_orfaos = [
+
+        pdf
+        for pdf in pdfs
+
+        if not pdf["usado"]
+    ]
+
+    # --------------------------------------------------------
+    # ESTATÍSTICAS
+    # --------------------------------------------------------
+
+    total_xml = len(
+        xmls
     )
 
-    print("\nIndexando PDFs...")
-
-    indice_pdfs = indexar_pdfs()
-
-    print(
-        f"PDFs indexados: {len(indice_pdfs)}"
+    total_pdf = len(
+        pdfs
     )
 
-    print("\nProcessando XMLs...")
-
-    registros = processar_xmls(
-        clientes,
-        indice_pdfs
+    ok_xml = sum(
+        1
+        for resultado in resultados
+        if resultado.get(
+            "status"
+        ) == "OK"
     )
 
-    associados = identificar_pdfs_associados(
-        registros
+    revisao_xml = (
+        total_xml
+        - ok_xml
     )
 
-    pdfs_orfaos = listar_pdfs_orfaos(
-        indice_pdfs,
-        associados
+    pares = sum(
+        1
+        for resultado in resultados
+        if resultado.get(
+            "pdf"
+        ) is not None
     )
 
-    escrever_relatorio(
-        registros,
-        indice_pdfs,
-        pdfs_orfaos
-    )
+    # ========================================================
+    # RELATÓRIO
+    # ========================================================
 
-    print("\n" + "=" * 70)
+    with open(
+        ARQUIVO_RELATORIO,
+        "w",
+        encoding="utf-8"
+    ) as f:
 
-    print(
-        f"XMLs processados: {len(registros)}"
-    )
+        f.write(
+            "RELATÓRIO DE SIMULAÇÃO - V8\n"
+        )
 
-    print(
-        f"PDFs encontrados: {len(indice_pdfs)}"
-    )
+        f.write(
+            "Nenhum arquivo foi "
+            "movido ou renomeado.\n\n"
+        )
 
-    print(
-        "Pares XML + PDF: "
-        + str(
-            sum(
-                1
-                for r in registros
-                if r["pdf"]
+        f.write(
+            f"XMLs encontrados: "
+            f"{total_xml}\n"
+        )
+
+        f.write(
+            f"PDFs encontrados: "
+            f"{total_pdf}\n"
+        )
+
+        f.write(
+            f"XMLs OK: "
+            f"{ok_xml}\n"
+        )
+
+        f.write(
+            f"XMLs em revisão: "
+            f"{revisao_xml}\n"
+        )
+
+        f.write(
+            f"XML/PDF associados: "
+            f"{pares}\n"
+        )
+
+        f.write(
+            f"PDFs órfãos: "
+            f"{len(pdfs_orfaos)}\n"
+        )
+
+        # ----------------------------------------------------
+        # RESULTADOS XML
+        # ----------------------------------------------------
+
+        for resultado in resultados:
+
+            escrever_resultado(
+                f,
+                resultado
             )
+
+        # ----------------------------------------------------
+        # ÓRFÃOS
+        # ----------------------------------------------------
+
+        f.write(
+            "\n\n"
+            + "#"
+            * 90
+            + "\n"
         )
+
+        f.write(
+            "PDFs ORFÃOS / NÃO ASSOCIADOS\n"
+        )
+
+        f.write(
+            "#"
+            * 90
+            + "\n"
+        )
+
+        for pdf in pdfs_orfaos:
+
+            f.write(
+                "\n"
+            )
+
+            f.write(
+                f"PDF: "
+                f"{pdf['arquivo'].name}\n"
+            )
+
+            f.write(
+                "CHAVES: "
+                f"{', '.join(pdf['chaves'])}"
+                "or 'nenhuma'}\n"
+            )
+
+            f.write(
+                "NÚMEROS: "
+                f"{', '.join(pdf['numeros'])} "
+                "or 'nenhum'}\n"
+            )
+
+            f.write(
+                "CNPJs: "
+                f"{', '.join(pdf['cnpjs'])} "
+                "or 'nenhum'}\n"
+            )
+
+            f.write(
+                "DATAS: "
+                f"{', '.join(pdf['datas'])} "
+                "or 'nenhuma'}\n"
+            )
+
+        # ----------------------------------------------------
+        # FINAL
+        # ----------------------------------------------------
+
+        f.write(
+            "\n\n"
+            + "#"
+            * 90
+            + "\n"
+        )
+
+        f.write(
+            "FIM DO RELATÓRIO\n"
+        )
+
+        f.write(
+            "MODO SIMULAÇÃO — "
+            "NENHUM ARQUIVO FOI ALTERADO.\n"
+        )
+
+    # ========================================================
+    # CONSOLE
+    # ========================================================
+
+    print()
+
+    print(
+        "=============================================="
     )
 
     print(
-        f"PDFs órfãos: {len(pdfs_orfaos)}"
+        " SIMULAÇÃO CONCLUÍDA"
     )
 
     print(
-        f"\nRelatório criado: {ARQUIVO_RELATORIO}"
+        "=============================================="
     )
 
     print(
-        "\nNENHUM ARQUIVO FOI MOVIDO OU RENOMEADO."
+        f"XMLs: "
+        f"{total_xml}"
     )
 
-    print("=" * 70)
+    print(
+        f"PDFs: "
+        f"{total_pdf}"
+    )
 
+    print(
+        f"XMLs OK: "
+        f"{ok_xml}"
+    )
+
+    print(
+        f"XMLs revisão: "
+        f"{revisao_xml}"
+    )
+
+    print(
+        f"Pares XML/PDF: "
+        f"{pares}"
+    )
+
+    print(
+        f"PDFs órfãos: "
+        f"{len(pdfs_orfaos)}"
+    )
+
+    print()
+
+    print(
+        f"Relatório: "
+        f"{ARQUIVO_RELATORIO}"
+    )
+
+    print()
+
+    print(
+        "NENHUM ARQUIVO FOI "
+        "MOVIDO OU RENOMEADO."
+    )
+
+
+# ============================================================
+# EXECUÇÃO
+# ============================================================
 
 if __name__ == "__main__":
     main()
