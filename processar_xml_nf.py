@@ -1,78 +1,87 @@
 # -*- coding: utf-8 -*-
 """
-PROCESSAR XML DE NF-e
+RESUMO XML + PDF DE NF-e
+===========================
 
-ETAPA 1 - TESTE / SIMULAÇÃO
-----------------------------
-Lê os XMLs colocados em A_PROCESSAR, identifica:
-- CNPJ do emitente
-- CNPJ do destinatário
-- número da NF
-- data de emissão
+MODO ATUAL: SIMULAÇÃO
+- Não move arquivos.
+- Analisa XMLs e PDFs encontrados em A_PROCESSAR.
+- Gera relatorio_xml_pdf.txt.
 
-Depois consulta banco.xlsx para descobrir o cliente.
+XML:
+- tenta identificar emitente, destinatário, número e data;
+- cruza o CNPJ com banco.xlsx.
 
-REGRA:
-- CNPJ do cliente = emitente  -> SAIDAS
-- CNPJ do cliente = destinatário -> ENTRADAS
+PDF:
+- tenta extrair texto do DANFE;
+- procura número da NF, chave de acesso, CNPJ e data;
+- usa o conteúdo para auxiliar a identificação.
 
 IMPORTANTE:
-Por enquanto o script NÃO MOVE os XMLs.
-Ele apenas analisa e gera um relatório.
+O PDF pode exigir tratamento adicional dependendo do modelo/qualidade.
+Por isso, nenhum arquivo é movido nesta etapa ainda.
 
-Quando a conferência estiver correta, basta mudar:
-MODO_EXECUCAO = True
+Dependências:
+    python -m pip install openpyxl pypdf
 """
 
 from pathlib import Path
+import re
 import openpyxl
 import xml.etree.ElementTree as ET
 from datetime import datetime
-import re
+
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
 
 # ============================================================
 # CONFIGURAÇÃO
 # ============================================================
 
-MODO_EXECUCAO = False   # False = apenas relatório | True = mover os XMLs
-
-ANO_PADRAO = None       # None = usa o ano da NF-e
+MODO_EXECUCAO = False  # False = simulação | True = mover
 
 BASE = Path(__file__).resolve().parent
-
 ARQUIVO_EXCEL = BASE / "banco.xlsx"
 PASTA_PROCESSAR = BASE / "A_PROCESSAR"
-PASTA_ERROS = BASE / "ERROS_XML"
-RELATORIO = BASE / "relatorio_xml.txt"
+RELATORIO = BASE / "relatorio_xml_pdf.txt"
 
 # ============================================================
-# FUNÇÕES
+# FUNÇÕES GERAIS
 # ============================================================
 
 def normalizar_cnpj(valor):
-    """Retorna somente os números do CNPJ."""
     if valor is None:
         return ""
     return re.sub(r"\D", "", str(valor))
 
 
-def texto_local(elemento, nome):
-    """Procura uma tag ignorando namespace."""
+def normalizar_numero_nf(valor):
+    if not valor:
+        return ""
+    valor = str(valor).strip()
+    # Remove zeros à esquerda apenas para comparação;
+    # o número original do XML será usado no nome quando possível.
+    try:
+        return str(int(valor))
+    except Exception:
+        return re.sub(r"\D", "", valor)
+
+
+def localizar_tag(elemento, nome):
     if elemento is None:
         return None
 
     for filho in elemento.iter():
-        tag = filho.tag
-        if isinstance(tag, str):
-            tag_sem_ns = tag.split("}")[-1]
-            if tag_sem_ns == nome:
-                return (filho.text or "").strip()
+        tag = filho.tag.split("}")[-1] if isinstance(filho.tag, str) else ""
+        if tag == nome:
+            return (filho.text or "").strip()
 
     return None
 
 
-def localizar_inf_nfe(root):
-    """Localiza infNFe dentro de NFe/nfeProc."""
+def encontrar_inf_nfe(root):
     for elemento in root.iter():
         tag = elemento.tag.split("}")[-1] if isinstance(elemento.tag, str) else ""
         if tag == "infNFe":
@@ -80,19 +89,21 @@ def localizar_inf_nfe(root):
     return None
 
 
-def ler_nfe(caminho):
-    """Extrai os dados principais do XML."""
+# ============================================================
+# XML
+# ============================================================
+
+def ler_xml(caminho):
     try:
         root = ET.parse(caminho).getroot()
     except Exception as e:
-        return None, f"XML inválido ou não foi possível ler: {e}"
+        return None, f"XML inválido: {e}"
 
-    inf = localizar_inf_nfe(root)
+    inf = encontrar_inf_nfe(root)
 
     if inf is None:
-        return None, "Não foi encontrado o elemento infNFe. O arquivo pode não ser uma NF-e."
+        return None, "Não foi encontrado infNFe."
 
-    # Emitente e destinatário são procurados dentro de infNFe
     emit = None
     dest = None
 
@@ -103,48 +114,145 @@ def ler_nfe(caminho):
         elif tag == "dest":
             dest = filho
 
-    cnpj_emitente = texto_local(emit, "CNPJ")
-    cnpj_destinatario = texto_local(dest, "CNPJ")
-
-    numero = texto_local(inf, "nNF")
-    chave = inf.attrib.get("Id", "")
-    chave = re.sub(r"^NFe", "", chave)
-
-    data = texto_local(inf, "dhEmi") or texto_local(inf, "dEmi")
+    cnpj_emitente = localizar_tag(emit, "CNPJ")
+    cnpj_destinatario = localizar_tag(dest, "CNPJ")
+    numero = localizar_tag(inf, "nNF")
+    data = localizar_tag(inf, "dhEmi") or localizar_tag(inf, "dEmi")
 
     if not cnpj_emitente:
         return None, "XML sem CNPJ do emitente."
 
     if not numero:
-        return None, "XML sem número da NF (nNF)."
+        return None, "XML sem número da NF."
 
     if not data:
-        return None, "XML sem data de emissão (dhEmi/dEmi)."
+        return None, "XML sem data de emissão."
 
-    # Converte a data para datetime
     try:
         if "T" in data:
             data_nf = datetime.fromisoformat(data.replace("Z", "+00:00"))
         else:
             data_nf = datetime.strptime(data[:10], "%Y-%m-%d")
     except Exception:
-        return None, f"Data de emissão inválida: {data}"
+        return None, f"Data inválida: {data}"
+
+    chave = inf.attrib.get("Id", "")
+    chave = re.sub(r"^NFe", "", chave)
 
     return {
+        "tipo": "XML",
+        "arquivo": caminho.name,
         "emitente": normalizar_cnpj(cnpj_emitente),
         "destinatario": normalizar_cnpj(cnpj_destinatario),
         "numero": str(numero).strip(),
+        "numero_cmp": normalizar_numero_nf(numero),
         "data": data_nf,
-        "chave": chave,
+        "chave": re.sub(r"\D", "", chave),
     }, None
 
 
+# ============================================================
+# PDF
+# ============================================================
+
+def extrair_texto_pdf(caminho):
+    if PdfReader is None:
+        return None, "Biblioteca pypdf não instalada."
+
+    try:
+        reader = PdfReader(str(caminho))
+        paginas = []
+
+        for pagina in reader.pages:
+            try:
+                paginas.append(pagina.extract_text() or "")
+            except Exception:
+                paginas.append("")
+
+        texto = "\n".join(paginas)
+
+        if not texto.strip():
+            return None, "PDF sem texto extraível. Pode ser PDF escaneado/imagem."
+
+        return texto, None
+
+    except Exception as e:
+        return None, f"Erro ao ler PDF: {e}"
+
+
+def limpar_cnpj_texto(valor):
+    return normalizar_cnpj(valor)
+
+
+def extrair_dados_pdf(caminho):
+    texto, erro = extrair_texto_pdf(caminho)
+
+    if erro:
+        return None, erro
+
+    texto_compacto = re.sub(r"[ \t]+", " ", texto)
+    texto_maiusculo = texto_compacto.upper()
+
+    # Chave de acesso: 44 dígitos, geralmente impressa no DANFE.
+    chaves = re.findall(r"\b\d{44}\b", re.sub(r"\D", " ", texto))
+    chave = chaves[0] if chaves else ""
+
+    # Número da NF.
+    numero = ""
+    padroes_nf = [
+        r"N[ÚU]MERO\s*(?:DA\s*)?NF(?:-E)?\s*[:.]?\s*([0-9]{1,12})",
+        r"N[ÚU]MERO\s*[:.]?\s*([0-9]{1,12})",
+        r"NF(?:-E)?\s*N[º°]?\s*[:.]?\s*([0-9]{1,12})",
+    ]
+
+    for padrao in padroes_nf:
+        m = re.search(padrao, texto_maiusculo)
+        if m:
+            numero = m.group(1)
+            break
+
+    # CNPJs encontrados no PDF.
+    cnpjs = []
+    encontrados = re.findall(
+        r"\d{2}[.\s]?\d{3}[.\s]?\d{3}[\/\s]?\d{3,4}[-\s]?\d{2}",
+        texto_compacto
+    )
+
+    for item in encontrados:
+        cnpj = limpar_cnpj_texto(item)
+        if len(cnpj) == 14 and cnpj not in cnpjs:
+            cnpjs.append(cnpj)
+
+    # Datas no padrão brasileiro.
+    datas = re.findall(r"\b\d{2}/\d{2}/\d{4}\b", texto_compacto)
+
+    data_nf = None
+    for d in datas:
+        try:
+            data_nf = datetime.strptime(d, "%d/%m/%Y")
+            break
+        except Exception:
+            pass
+
+    return {
+        "tipo": "PDF",
+        "arquivo": caminho.name,
+        "chave": chave,
+        "numero": numero,
+        "numero_cmp": normalizar_numero_nf(numero),
+        "cnpjs": cnpjs,
+        "data": data_nf,
+        "texto": texto,
+    }, None
+
+
+# ============================================================
+# CLIENTES
+# ============================================================
+
 def carregar_clientes():
-    """Lê COD, RAZÃO SOCIAL, CNPJ e CAMINHO ABSOLUTO."""
     if not ARQUIVO_EXCEL.exists():
-        raise FileNotFoundError(
-            f"Não encontrei {ARQUIVO_EXCEL}"
-        )
+        raise FileNotFoundError(f"Não encontrei {ARQUIVO_EXCEL}")
 
     wb = openpyxl.load_workbook(ARQUIVO_EXCEL, data_only=True)
     ws = wb[wb.sheetnames[0]]
@@ -156,11 +264,11 @@ def carregar_clientes():
             headers[str(valor).strip().upper()] = col
 
     obrigatorias = ["COD", "RAZÃO SOCIAL", "CNPJ", "CAMINHO ABSOLUTO"]
-    faltantes = [h for h in obrigatorias if h not in headers]
+    faltantes = [x for x in obrigatorias if x not in headers]
 
     if faltantes:
         raise ValueError(
-            "Colunas faltantes na planilha: " + ", ".join(faltantes)
+            "Colunas faltantes: " + ", ".join(faltantes)
         )
 
     clientes = {}
@@ -185,20 +293,89 @@ def carregar_clientes():
     return clientes
 
 
-def pasta_mes(data_nf):
-    ano = ANO_PADRAO or data_nf.year
-    mes = data_nf.month
-    return str(ano), f"{mes:02d}-{str(ano)[-2:]}"
+# ============================================================
+# LOCALIZAÇÃO DO CLIENTE
+# ============================================================
+
+def cliente_por_cnpj(cnpj, clientes):
+    candidatos = clientes.get(cnpj, [])
+
+    if len(candidatos) == 1:
+        return candidatos[0], None
+
+    if len(candidatos) > 1:
+        nomes = " / ".join(str(x["razao"]) for x in candidatos)
+        return None, f"CNPJ duplicado na planilha: {nomes}"
+
+    return None, "CNPJ não encontrado na planilha."
+
+
+def determinar_destino_por_xml(dados, clientes):
+    cliente_emitente, erro_emitente = cliente_por_cnpj(
+        dados["emitente"], clientes
+    )
+
+    cliente_dest, erro_dest = cliente_por_cnpj(
+        dados["destinatario"], clientes
+    )
+
+    if cliente_emitente and cliente_dest:
+        return None, None, "Cliente aparece como emitente e destinatário."
+
+    if cliente_emitente:
+        return cliente_emitente, "SAIDAS", None
+
+    if cliente_dest:
+        return cliente_dest, "ENTRADAS", None
+
+    return None, None, (
+        f"Cliente não encontrado. "
+        f"Emitente={dados['emitente']} | "
+        f"Destinatário={dados['destinatario']}"
+    )
+
+
+def determinar_destino_por_pdf(dados, clientes):
+    candidatos = []
+
+    for cnpj in dados["cnpjs"]:
+        cliente, erro = cliente_por_cnpj(cnpj, clientes)
+        if cliente:
+            candidatos.append((cliente, cnpj))
+
+    # Remove duplicidades
+    unicos = {}
+    for cliente, cnpj in candidatos:
+        chave = (cliente["cnpj"], cliente["pasta"])
+        unicos[chave] = (cliente, cnpj)
+
+    candidatos = list(unicos.values())
+
+    if len(candidatos) == 1:
+        cliente, cnpj = candidatos[0]
+
+        # No PDF sozinho, ainda não temos com segurança
+        # se o cliente é emitente ou destinatário.
+        return cliente, None, (
+            "Cliente encontrado no PDF, mas entrada/saída precisa "
+            "ser confirmada pelo conteúdo/posição dos CNPJs ou XML."
+        )
+
+    if len(candidatos) > 1:
+        nomes = " / ".join(str(x[0]["razao"]) for x in candidatos)
+        return None, None, f"Mais de um cliente encontrado no PDF: {nomes}"
+
+    return None, None, "Nenhum CNPJ do PDF correspondeu à planilha."
 
 
 # ============================================================
-# INÍCIO
+# PROCESSAMENTO
 # ============================================================
 
 print()
-print("=" * 70)
-print("  PROCESSAMENTO DE XML DE NF-e")
-print("=" * 70)
+print("=" * 80)
+print("  ANÁLISE DE XML + PDF DE NF-e")
+print("=" * 80)
 print()
 
 PASTA_PROCESSAR.mkdir(parents=True, exist_ok=True)
@@ -206,151 +383,132 @@ PASTA_PROCESSAR.mkdir(parents=True, exist_ok=True)
 try:
     clientes = carregar_clientes()
 except Exception as e:
-    print("ERRO ao carregar a planilha:")
-    print(e)
+    print("ERRO:", e)
     input("\nPressione ENTER para fechar...")
     raise SystemExit(1)
 
-arquivos_xml = sorted(PASTA_PROCESSAR.glob("*.xml"))
+arquivos = sorted(
+    [
+        p for p in PASTA_PROCESSAR.iterdir()
+        if p.is_file() and p.suffix.lower() in (".xml", ".pdf")
+    ],
+    key=lambda x: x.name.lower()
+)
 
-print(f"Planilha: {ARQUIVO_EXCEL}")
-print(f"Pasta de entrada: {PASTA_PROCESSAR}")
-print(f"XML encontrados: {len(arquivos_xml)}")
+xmls = [p for p in arquivos if p.suffix.lower() == ".xml"]
+pdfs = [p for p in arquivos if p.suffix.lower() == ".pdf"]
+
+print(f"Arquivos encontrados: {len(arquivos)}")
+print(f"XML: {len(xmls)}")
+print(f"PDF: {len(pdfs)}")
 print()
 
-if not arquivos_xml:
-    print("Nenhum XML encontrado em A_PROCESSAR.")
-    print("Coloque os XMLs nessa pasta e execute novamente.")
-    input("\nPressione ENTER para fechar...")
-    raise SystemExit(0)
-
 resultados = []
-quantidade_ok = 0
-quantidade_erro = 0
 
-for xml in arquivos_xml:
-    dados, erro = ler_nfe(xml)
+# ---------- XML ----------
+dados_xml = {}
+
+for arquivo in xmls:
+    dados, erro = ler_xml(arquivo)
 
     if erro:
-        quantidade_erro += 1
         resultados.append(
-            f"ERRO | {xml.name} | {erro}"
+            f"REVISAR | XML | {arquivo.name} | {erro}"
         )
         continue
 
-    emitente = dados["emitente"]
-    destinatario = dados["destinatario"]
+    cliente, tipo, erro_destino = determinar_destino_por_xml(
+        dados, clientes
+    )
 
-    candidatos_emitente = clientes.get(emitente, [])
-    candidatos_destinatario = clientes.get(destinatario, [])
-
-    # Verifica em qual lado está o cliente
-    encontrou_saida = len(candidatos_emitente) > 0
-    encontrou_entrada = len(candidatos_destinatario) > 0
-
-    # Se o mesmo cliente aparece nos dois lados, não decide sozinho.
-    if encontrou_saida and encontrou_entrada:
-        quantidade_erro += 1
+    if erro_destino:
         resultados.append(
-            f"REVISAR | {xml.name} | "
-            f"Cliente aparece como emitente E destinatário | "
-            f"NF {dados['numero']} | "
-            f"Emitente {emitente} | Destinatário {destinatario}"
+            f"REVISAR | XML | {arquivo.name} | "
+            f"NF={dados['numero']} | {erro_destino}"
         )
         continue
 
-    if not encontrou_saida and not encontrou_entrada:
-        quantidade_erro += 1
-        resultados.append(
-            f"REVISAR | {xml.name} | "
-            f"Cliente não encontrado na planilha | "
-            f"NF {dados['numero']} | "
-            f"Emitente {emitente} | Destinatário {destinatario}"
-        )
-        continue
-
-    if encontrou_saida:
-        candidatos = candidatos_emitente
-        tipo = "SAIDAS"
-    else:
-        candidatos = candidatos_destinatario
-        tipo = "ENTRADAS"
-
-    # CNPJ duplicado na planilha: não escolhe automaticamente.
-    if len(candidatos) != 1:
-        quantidade_erro += 1
-        nomes = " / ".join(
-            str(c["razao"]) for c in candidatos
-        )
-        resultados.append(
-            f"REVISAR | {xml.name} | "
-            f"CNPJ cadastrado para mais de um cliente | "
-            f"NF {dados['numero']} | "
-            f"CNPJ {candidatos[0]['cnpj']} | "
-            f"Clientes: {nomes}"
-        )
-        continue
-
-    cliente = candidatos[0]
-    ano, mes = pasta_mes(dados["data"])
-
-    pasta_destino = (
+    dados["cliente"] = cliente
+    dados["tipo_movimento"] = tipo
+    dados["destino"] = (
         Path(cliente["pasta"])
         / "NF"
         / tipo
-        / ano
-        / mes
+        / str(dados["data"].year)
+        / f"{dados['data'].month:02d}-{str(dados['data'].year)[-2:]}"
+        / f"NF {dados['numero']}.xml"
     )
 
-    novo_nome = f"NF {dados['numero']}.xml"
-    destino = pasta_destino / novo_nome
-
-    if not cliente["pasta"]:
-        quantidade_erro += 1
-        resultados.append(
-            f"REVISAR | {xml.name} | Caminho absoluto vazio para "
-            f"{cliente['razao']}"
-        )
-        continue
-
-    if not Path(cliente["pasta"]).exists():
-        quantidade_erro += 1
-        resultados.append(
-            f"REVISAR | {xml.name} | Pasta do cliente não existe: "
-            f"{cliente['pasta']}"
-        )
-        continue
-
-    if destino.exists():
-        quantidade_erro += 1
-        resultados.append(
-            f"CONFLITO | {xml.name} | Destino já existe: {destino}"
-        )
-        continue
-
-    # Por enquanto, somente simulação.
-    if MODO_EXECUCAO:
-        try:
-            pasta_destino.mkdir(parents=True, exist_ok=True)
-            xml.rename(destino)
-            acao = "MOVIDO"
-        except Exception as e:
-            quantidade_erro += 1
-            resultados.append(
-                f"ERRO | {xml.name} | Falha ao mover: {e}"
-            )
-            continue
-    else:
-        acao = "SIMULAÇÃO"
-
-    quantidade_ok += 1
+    dados_xml[dados["chave"]] = dados
 
     resultados.append(
-        f"{acao} | {xml.name} | "
-        f"{tipo} | Cliente: {cliente['cod']} - {cliente['razao']} | "
-        f"NF {dados['numero']} | "
-        f"Data {dados['data']:%d/%m/%Y} | "
-        f"Destino: {destino}"
+        f"OK | XML | {arquivo.name} | "
+        f"{tipo} | Cliente={cliente['cod']} - {cliente['razao']} | "
+        f"NF={dados['numero']} | Data={dados['data']:%d/%m/%Y} | "
+        f"Destino={dados['destino']}"
+    )
+
+# ---------- PDF ----------
+for arquivo in pdfs:
+    dados, erro = extrair_dados_pdf(arquivo)
+
+    if erro:
+        resultados.append(
+            f"REVISAR | PDF | {arquivo.name} | {erro}"
+        )
+        continue
+
+    # Primeiro tenta casar com XML pela chave.
+    xml_correspondente = None
+
+    if dados["chave"]:
+        for xml_dados in dados_xml.values():
+            if xml_dados.get("chave") == dados["chave"]:
+                xml_correspondente = xml_dados
+                break
+
+    # Se não houver chave, tenta pelo número da NF.
+    if xml_correspondente is None and dados["numero_cmp"]:
+        candidatos = [
+            x for x in dados_xml.values()
+            if x.get("numero_cmp") == dados["numero_cmp"]
+        ]
+
+        if len(candidatos) == 1:
+            xml_correspondente = candidatos[0]
+
+    if xml_correspondente:
+        destino_pdf = (
+            xml_correspondente["destino"].parent
+            / f"NF {xml_correspondente['numero']}.pdf"
+        )
+
+        resultados.append(
+            f"PAR XML/PDF | PDF | {arquivo.name} | "
+            f"Cliente={xml_correspondente['cliente']['cod']} - "
+            f"{xml_correspondente['cliente']['razao']} | "
+            f"NF={xml_correspondente['numero']} | "
+            f"{xml_correspondente['tipo_movimento']} | "
+            f"Destino={destino_pdf}"
+        )
+        continue
+
+    # PDF sem XML correspondente.
+    cliente, tipo, aviso = determinar_destino_por_pdf(dados, clientes)
+
+    if cliente is None:
+        resultados.append(
+            f"REVISAR | PDF | {arquivo.name} | "
+            f"NF={dados['numero'] or '?'} | {aviso}"
+        )
+        continue
+
+    # Sem XML, não vamos adivinhar entrada/saída.
+    resultados.append(
+        f"REVISAR | PDF | {arquivo.name} | "
+        f"NF={dados['numero'] or '?'} | "
+        f"Cliente={cliente['cod']} - {cliente['razao']} | "
+        f"{aviso}"
     )
 
 # ============================================================
@@ -358,31 +516,28 @@ for xml in arquivos_xml:
 # ============================================================
 
 with open(RELATORIO, "w", encoding="utf-8") as f:
-    f.write("RELATÓRIO DE PROCESSAMENTO DE XML - NF-e\n")
-    f.write("=" * 100 + "\n")
+    f.write("RELATÓRIO - ANÁLISE DE XML + PDF DE NF-e\n")
+    f.write("=" * 110 + "\n")
     f.write(f"Data/hora: {datetime.now():%d/%m/%Y %H:%M:%S}\n")
-    f.write(f"Modo de execução: {'MOVER ARQUIVOS' if MODO_EXECUCAO else 'SIMULAÇÃO'}\n")
-    f.write(f"XML encontrados: {len(arquivos_xml)}\n")
-    f.write(f"Processados com sucesso: {quantidade_ok}\n")
-    f.write(f"Revisões/erros: {quantidade_erro}\n\n")
+    f.write(f"Modo: {'EXECUÇÃO' if MODO_EXECUCAO else 'SIMULAÇÃO'}\n")
+    f.write(f"Total de arquivos XML/PDF: {len(arquivos)}\n")
+    f.write(f"XML: {len(xmls)}\n")
+    f.write(f"PDF: {len(pdfs)}\n\n")
 
     for linha in resultados:
         f.write(linha + "\n")
 
-print("=" * 70)
-print("RESULTADO")
-print("=" * 70)
-print(f"XML encontrados:        {len(arquivos_xml)}")
-print(f"Processados:            {quantidade_ok}")
-print(f"Revisões/erros:         {quantidade_erro}")
+print("=" * 80)
+print("ANÁLISE CONCLUÍDA")
+print("=" * 80)
+print(f"Total: {len(arquivos)} arquivos")
+print(f"XML:   {len(xmls)}")
+print(f"PDF:   {len(pdfs)}")
 print()
-print(f"Relatório: {RELATORIO}")
+print(f"Relatório criado em:")
+print(RELATORIO)
 print()
-
-if not MODO_EXECUCAO:
-    print("MODO SIMULAÇÃO: nenhum XML foi movido.")
-    print("Primeiro vamos conferir o relatório.")
-else:
-    print("MODO EXECUÇÃO: os XMLs aprovados foram movidos.")
+print("IMPORTANTE: nenhum arquivo foi movido.")
+print("Vamos revisar o relatório antes de ativar qualquer movimentação.")
 
 input("\nPressione ENTER para fechar...")
