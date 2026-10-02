@@ -1,3 +1,4 @@
+# V4 - correção da extração de data e diagnóstico de XML/PDF
 import os
 import re
 import shutil
@@ -31,7 +32,7 @@ MODO_EXECUCAO = False   # False = SIMULAÇÃO | True = MOVIMENTA OS ARQUIVOS
 BASE = os.path.dirname(os.path.abspath(__file__))
 ARQUIVO_EXCEL = os.path.join(BASE, "banco.xlsx")
 PASTA_PROCESSAR = os.path.join(BASE, "A_PROCESSAR")
-ARQUIVO_RELATORIO = os.path.join(BASE, "relatorio_xml_pdf_v2.txt")
+ARQUIVO_RELATORIO = os.path.join(BASE, "relatorio_xml_pdf_v4.txt")
 
 
 # ============================================================
@@ -81,21 +82,45 @@ def extrair_data_valor(valor):
     if not valor:
         return None
 
-    m = re.search(r"(\\d{4})-(\\d{2})-(\\d{2})", str(valor))
+    valor = str(valor).strip()
+
+    # ISO: 2026-09-15T10:30:00-03:00
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", valor)
     if m:
         try:
             return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
         except ValueError:
             pass
 
-    m = re.search(r"(\\d{4})(\\d{2})(\\d{2})", str(valor))
+    # Somente YYYYMMDD
+    m = re.search(r"(\d{4})(\d{2})(\d{2})", valor)
     if m:
         try:
             return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+
+    # dd/mm/yyyy ou dd-mm-yyyy
+    m = re.search(r"(\d{2})[/-](\d{2})/(20\d{2})", valor)
+    if m:
+        try:
+            return datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)))
         except ValueError:
             pass
 
     return None
+
+
+def diagnostico_xml(root):
+    tags = []
+    for elem in root.iter():
+        if isinstance(elem.tag, str):
+            tag = elem.tag.split("}")[-1]
+            if tag not in tags:
+                tags.append(tag)
+        if len(tags) >= 30:
+            break
+    return ", ".join(tags)
 
 
 def encontrar_inf_nfe(root):
@@ -240,7 +265,7 @@ def extrair_data_pdf(texto):
     if not texto:
         return None
 
-    # Formatos comuns: 15/09/2026 (br)
+    # Formatos comuns: 15/09/2026
     padroes = [
         r"\b(\d{2})/(\d{2})/(\d{4})\b",
         r"\b(\d{2})-(\d{2})-(\d{4})\b",
@@ -401,7 +426,9 @@ def analisar_xml(caminho, clientes):
 
     if inf is None:
         resultado["status"] = "REVISÃO"
-        resultado["motivo"] = "XML sem infNFe; provavelmente não é um XML NF-e padrão."
+        resultado["motivo"] = (
+            "XML sem infNFe. Tags encontradas: " + diagnostico_xml(root)
+        )
         return resultado
 
     chave = inf.attrib.get("Id", "")
@@ -428,8 +455,7 @@ def analisar_xml(caminho, clientes):
 
     resultado["numero_nf"] = normalizar_numero_nf(texto_tag(inf, "nNF"))
 
-    # dhEmi/dEmi normalmente ficam dentro de <ide>, que é filho de
-    # <infNFe>. Procuramos em toda a árvore do XML para não perder a data.
+    # Procura dhEmi/dEmi em toda a árvore, inclusive com namespace.
     resultado["data"] = None
     for elem in root.iter():
         nome = elem.tag.split("}")[-1]
@@ -439,6 +465,18 @@ def analisar_xml(caminho, clientes):
                 resultado["data"] = extrair_data_valor(valor_data)
                 if resultado["data"]:
                     break
+
+    # Alguns documentos podem trazer a data em atributo.
+    if not resultado["data"]:
+        for elem in root.iter():
+            for nome_attr, valor_attr in elem.attrib.items():
+                nome_attr = nome_attr.split("}")[-1]
+                if nome_attr in ("dhEmi", "dEmi"):
+                    resultado["data"] = extrair_data_valor(valor_attr)
+                    if resultado["data"]:
+                        break
+            if resultado["data"]:
+                break
 
     # Se o XML não tiver CNPJ do emitente, tentamos usar a chave.
     if not resultado["cnpj_emitente"] and len(resultado["chave"]) == 44:
@@ -674,6 +712,16 @@ def analisar_pdf(caminho, clientes, xml_por_chave):
         resultado["motivo"] = "Número da NF não identificado com segurança."
         return resultado
 
+    # Proteção: PDFs que resultam em NF 1 e cuja chave não seja claramente
+    # de NF-e modelo 55 não serão considerados automaticamente.
+    if resultado["numero_nf"] == "1" and dados_chave.get("modelo") != "55":
+        resultado["status"] = "REVISÃO"
+        resultado["motivo"] = (
+            "Identificação suspeita: NF 1 e chave sem modelo 55. "
+            "Documento precisa de conferência manual."
+        )
+        return resultado
+
     if not resultado["data"]:
         resultado["status"] = "REVISÃO"
         resultado["motivo"] = "Data da NF não identificada com segurança."
@@ -713,7 +761,7 @@ def destino_nome(resultado, extensao):
 
 def processar():
     print("=" * 70)
-    print("ORGANIZADOR NF-e XML + PDF - V2")
+    print("ORGANIZADOR NF-e XML + PDF - V4")
     print("=" * 70)
 
     if not os.path.exists(PASTA_PROCESSAR):
@@ -775,7 +823,7 @@ def processar():
 
     linhas = []
     linhas.append("=" * 90)
-    linhas.append("RELATÓRIO - ORGANIZADOR NF-e XML + PDF V3")
+    linhas.append("RELATÓRIO - ORGANIZADOR NF-e XML + PDF V4")
     linhas.append("=" * 90)
     linhas.append(
         f"Data/hora: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
