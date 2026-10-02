@@ -77,6 +77,27 @@ def extrair_data_xml(elemento):
     return None
 
 
+def extrair_data_valor(valor):
+    if not valor:
+        return None
+
+    m = re.search(r"(\\d{4})-(\\d{2})-(\\d{2})", str(valor))
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+
+    m = re.search(r"(\\d{4})(\\d{2})(\\d{2})", str(valor))
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+
+    return None
+
+
 def encontrar_inf_nfe(root):
     for elem in root.iter():
         if elem.tag.split("}")[-1] == "infNFe":
@@ -219,7 +240,7 @@ def extrair_data_pdf(texto):
     if not texto:
         return None
 
-    # Formatos comuns: 15/09/2026
+    # Formatos comuns: 15/09/2026 (br)
     padroes = [
         r"\b(\d{2})/(\d{2})/(\d{4})\b",
         r"\b(\d{2})-(\d{2})-(\d{4})\b",
@@ -406,7 +427,18 @@ def analisar_xml(caminho, clientes):
         resultado["cnpj_destinatario"] = normalizar_cnpj(texto_tag(dest, "CNPJ"))
 
     resultado["numero_nf"] = normalizar_numero_nf(texto_tag(inf, "nNF"))
-    resultado["data"] = extrair_data_xml(inf)
+
+    # dhEmi/dEmi normalmente ficam dentro de <ide>, que é filho de
+    # <infNFe>. Procuramos em toda a árvore do XML para não perder a data.
+    resultado["data"] = None
+    for elem in root.iter():
+        nome = elem.tag.split("}")[-1]
+        if nome in ("dhEmi", "dEmi"):
+            valor_data = (elem.text or "").strip()
+            if valor_data:
+                resultado["data"] = extrair_data_valor(valor_data)
+                if resultado["data"]:
+                    break
 
     # Se o XML não tiver CNPJ do emitente, tentamos usar a chave.
     if not resultado["cnpj_emitente"] and len(resultado["chave"]) == 44:
@@ -743,7 +775,7 @@ def processar():
 
     linhas = []
     linhas.append("=" * 90)
-    linhas.append("RELATÓRIO - ORGANIZADOR NF-e XML + PDF V2")
+    linhas.append("RELATÓRIO - ORGANIZADOR NF-e XML + PDF V3")
     linhas.append("=" * 90)
     linhas.append(
         f"Data/hora: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
