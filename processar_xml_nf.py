@@ -14,7 +14,7 @@ from pypdf import PdfReader
 
 PASTA_PROCESSAR = Path("A_PROCESSAR")
 ARQUIVO_BANCO = Path("banco.xlsx")
-ARQUIVO_RELATORIO = Path("relatorio_xml_pdf_v9.txt")
+ARQUIVO_RELATORIO = Path("relatorio_xml_pdf_v10.txt")
 
 
 # ============================================================
@@ -321,52 +321,72 @@ def candidatos_numero_xml(
     tipo,
     caminho_xml
 ):
-    """
-    V9: usa apenas fontes explícitas e confiáveis.
-    Não infere número pelo nome do arquivo nem por substring genérica de tag
-    (por exemplo, finNFe/finNFSe).
+    """V10: extração redundante, com fontes graduadas e sem inferência solta.
+
+    Prioriza tags oficiais. Só usa aliases explícitos quando não existe número
+    oficial; chaves de acesso continuam sendo uma segunda fonte forte para NF-e.
+    Não usa números aleatórios do nome do arquivo.
     """
     candidatos = []
     dados = extrair_textos_xml(root)
 
-    if tipo == "NF-e":
-        tags_prioritarias = {"nNF"}
-    elif tipo == "NFS-e":
-        tags_prioritarias = {
+    tags_oficiais = {
+        "NF-e": {"nNF"},
+        "NFS-e": {
             "nNFSe", "NumeroNfse", "NumeroNFSe",
-            "numeroNfse", "numeroNFSe", "Numero", "numero"
-        }
-    else:
-        tags_prioritarias = set()
+            "numeroNfse", "numeroNFSe"
+        },
+    }
+    tags_alternativas = {
+        "NF-e": set(),
+        "NFS-e": {
+            "NumeroNota", "numeroNota", "NumeroNfseNacional",
+            "numeroNfseNacional", "NumeroDocumento", "numeroDocumento",
+            "Numero", "numero", "NumNota", "numNota", "nNota"
+        },
+    }
 
-    for item in dados:
-        if item["tag"] not in tags_prioritarias:
-            continue
-
-        texto = str(item.get("texto", "")).strip()
-        # Valor da tag precisa ser puramente numérico; sem capturar números
-        # embutidos em textos ou identificadores.
+    def adicionar(tag_item, peso, sufixo=""):
+        texto = str(tag_item.get("texto", "")).strip()
         if not re.fullmatch(r"\d{1,12}", texto):
-            continue
-
+            return
         numero = limpar_numero(texto)
         if not numero or numero == "0":
-            continue
-
+            return
         candidatos.append({
             "numero": numero,
-            "metodo": f"tag:{item['tag']}",
-            "peso": 100
+            "metodo": f"tag:{tag_item['tag']}{sufixo}",
+            "peso": peso
         })
 
-    # Chave de acesso como alternativa apenas para NF-e modelo 55.
-    # Não tenta interpretar chaves no nome do arquivo como número de documento.
-    texto_xml = " ".join(item.get("texto", "") for item in dados)
-    chaves = encontrar_chaves(texto_xml)
-    chaves += encontrar_chaves(" ".join(
-        str(v) for elem in root.iter() for v in elem.attrib.values()
-    ))
+    oficiais_encontrados = False
+    for item in dados:
+        if item["tag"] in tags_oficiais.get(tipo, set()):
+            oficiais_encontrados = True
+            adicionar(item, 100)
 
+    # Aliases NFS-e só entram se não foi encontrada tag oficial.
+    if not oficiais_encontrados:
+        for item in dados:
+            if item["tag"] in tags_alternativas.get(tipo, set()):
+                adicionar(item, 75, "_alternativa")
+
+    # Alguns provedores guardam o número em atributo de identificação.
+    # Atributos só são usados quando ainda não há número candidato.
+    if not candidatos and tipo == "NFS-e":
+        aliases_attr = {"numero", "numeronfse", "numeronota", "idnfse"}
+        for elem in root.iter():
+            for nome, valor in elem.attrib.items():
+                nome_limpo = nome_tag(nome)
+                if nome_limpo.lower() not in aliases_attr:
+                    continue
+                item = {"tag": f"atributo:{nome_limpo}", "texto": str(valor).strip()}
+                adicionar(item, 65, "_atributo")
+
+    # Chaves podem estar no texto, em atributos ou no nome original do XML.
+    texto_xml = " ".join(item.get("texto", "") for item in dados)
+    atributos = " ".join(str(v) for elem in root.iter() for v in elem.attrib.values())
+    chaves = encontrar_chaves(texto_xml + " " + atributos + " " + Path(caminho_xml).stem)
     chaves_validas = []
     for chave in chaves:
         if validar_chave_nfe(chave) and chave not in chaves_validas:
@@ -900,27 +920,34 @@ def extrair_texto_pdf(caminho):
 # ============================================================
 
 def extrair_numeros_pdf(texto):
-    """
-    Extrai números de PDF somente quando há rótulo textual explícito.
-    Não usa todos os números do documento, pois isso gera falsos candidatos.
-    """
+    """V10: várias grafias de rótulos fiscais; evita números sem contexto."""
     if not texto:
         return []
 
-    texto_upper = str(texto).upper()
+    texto_upper = re.sub(r"[\u00a0\t]+", " ", str(texto).upper())
     padroes = [
-        r"\bN[ÚU]MERO\s+(?:DA\s+)?NOTA(?:\s+FISCAL)?\s*[:#\-]?\s*(\d{1,12})\b",
-        r"\bN[ÚU]MERO\s+(?:DA\s+)?NFS[ -]?E\s*[:#\-]?\s*(\d{1,12})\b",
-        r"\bN[ÚU]MERO\s+NFSE\s*[:#\-]?\s*(\d{1,12})\b",
-        r"\bN[º°O]\s*(?:DA\s+)?NOTA(?:\s+FISCAL)?\s*[:#\-]?\s*(\d{1,12})\b",
-        r"\bN[º°O]\s*(?:DA\s+)?NFS[ -]?E\s*[:#\-]?\s*(\d{1,12})\b",
-        r"\bNFSE\s*(?:N[º°O]\s*)?[:#\-]\s*(\d{1,12})\b",
+        # Nota fiscal / NFS-e
+        r"\bN[ÚU]MERO\s+(?:DA\s+)?(?:NOTA|NOTA FISCAL|NFS[ -]?E|NFSE|DOCUMENTO)\s*(?:FISCAL)?\s*(?:N[º°O.]?\s*)?[:#\-]?\s*(\d{1,12})\b",
+        r"\bN[º°O.]\s*(?:DA\s+)?(?:NOTA|NOTA FISCAL|NFS[ -]?E|NFSE|DOCUMENTO)\s*[:#\-]?\s*(\d{1,12})\b",
+        r"\b(?:NOTA FISCAL DE SERVI[CÇ]OS?|NOTA FISCAL DE SERVI[CÇ]O ELETR[ÔO]NICA|DANFSE)\s*(?:N[º°O.]?\s*)?[:#\-]?\s*(\d{1,12})\b",
+        r"\bNFS[ -]?E\s*(?:N[º°O.]?\s*)?[:#\-]?\s*(\d{1,12})\b",
+        r"\bNFSE\s*(?:N[º°O.]?\s*)?[:#\-]?\s*(\d{1,12})\b",
+        r"\bN[ÚU]MERO\s+DA\s+NOTA\s*\n\s*(\d{1,12})\b",
+        # Alguns layouts colocam o rótulo depois do número.
+        r"\b(\d{1,12})\s*(?:[-–:]\s*)?(?:N[º°O.]?\s*)?(?:DA\s+)?NOTA FISCAL\b",
     ]
 
     encontrados = []
     for padrao in padroes:
         for match in re.finditer(padrao, texto_upper):
             numero = limpar_numero(match.group(1))
+            if numero and numero != "0" and numero not in encontrados:
+                encontrados.append(numero)
+
+    # Redundância segura: número da NF-e obtido de uma chave de acesso válida.
+    for chave in encontrar_chaves(texto_upper):
+        if validar_chave_nfe(chave):
+            numero = numero_por_chave_nfe(chave)
             if numero and numero != "0" and numero not in encontrados:
                 encontrados.append(numero)
 
@@ -1309,7 +1336,7 @@ def processar_xml(
     )
 
     if resultado_cliente is None:
-        # V9: mesmo sem cliente cadastrado, tenta localizar o PDF correspondente.
+        # V10: mesmo sem cliente cadastrado, tenta localizar o PDF correspondente.
         # Isso ajuda a separar "documento encontrado" de "cliente identificado".
         info_sem_cliente = {
             "chave": chave,
@@ -1792,7 +1819,7 @@ def main():
 
     print(
         " PROCESSADOR XML + PDF "
-        "NF-e / NFS-e - V9"
+        "NF-e / NFS-e - V10"
     )
 
     print(
@@ -1945,7 +1972,7 @@ def main():
     ) as f:
 
         f.write(
-            "RELATÓRIO DE SIMULAÇÃO - V9\n"
+            "RELATÓRIO DE SIMULAÇÃO - V10\n"
         )
 
         f.write(
@@ -1981,6 +2008,11 @@ def main():
         f.write(
             f"PDFs órfãos: "
             f"{len(pdfs_orfaos)}\n"
+        )
+
+        pdfs_sem_texto = sum(1 for pdf in pdfs if not pdf.get("texto", "").strip())
+        f.write(
+            f"PDFs sem texto extraível (possível OCR): {pdfs_sem_texto}\n"
         )
 
         # ----------------------------------------------------
@@ -2027,28 +2059,29 @@ def main():
             )
 
             f.write(
-                "CHAVES: "
-                f"{', '.join(pdf['chaves'])}"
-                "or 'nenhuma'}\n"
+                f"CHAVES: {', '.join(pdf['chaves']) if pdf['chaves'] else 'nenhuma'}\n"
             )
 
             f.write(
-                "NÚMEROS: "
-                f"{', '.join(pdf['numeros'])} "
-                "or 'nenhum'}\n"
+                f"NÚMEROS: {', '.join(pdf['numeros']) if pdf['numeros'] else 'nenhum'}\n"
             )
 
             f.write(
-                "CNPJs: "
-                f"{', '.join(pdf['cnpjs'])} "
-                "or 'nenhum'}\n"
+                f"CNPJs: {', '.join(pdf['cnpjs']) if pdf['cnpjs'] else 'nenhum'}\n"
             )
 
             f.write(
-                "DATAS: "
-                f"{', '.join(pdf['datas'])} "
-                "or 'nenhuma'}\n"
+                f"DATAS: {', '.join(pdf['datas']) if pdf['datas'] else 'nenhuma'}\n"
             )
+
+            f.write(
+                "DIAGNÓSTICO: Nenhum XML correspondente encontrado neste lote pelos critérios atuais; "
+                "conferir se o XML foi baixado e se pertence à mesma competência.\n"
+            )
+            if not pdf.get("texto", "").strip():
+                f.write(
+                    "OBSERVAÇÃO: não foi possível extrair texto do PDF; pode ser digitalizado e exigir OCR.\n"
+                )
 
         # ----------------------------------------------------
         # FINAL
