@@ -14,7 +14,7 @@ from pypdf import PdfReader
 
 PASTA_PROCESSAR = Path("A_PROCESSAR")
 ARQUIVO_BANCO = Path("banco.xlsx")
-ARQUIVO_RELATORIO = Path("relatorio_xml_pdf_v8.txt")
+ARQUIVO_RELATORIO = Path("relatorio_xml_pdf_v9.txt")
 
 
 # ============================================================
@@ -321,222 +321,61 @@ def candidatos_numero_xml(
     tipo,
     caminho_xml
 ):
-
+    """
+    V9: usa apenas fontes explícitas e confiáveis.
+    Não infere número pelo nome do arquivo nem por substring genérica de tag
+    (por exemplo, finNFe/finNFSe).
+    """
     candidatos = []
-
     dados = extrair_textos_xml(root)
 
-    # --------------------------------------------------------
-    # MÉTODO 1 — TAGS EXATAS
-    # --------------------------------------------------------
+    if tipo == "NF-e":
+        tags_prioritarias = {"nNF"}
+    elif tipo == "NFS-e":
+        tags_prioritarias = {
+            "nNFSe", "NumeroNfse", "NumeroNFSe",
+            "numeroNfse", "numeroNFSe", "Numero", "numero"
+        }
+    else:
+        tags_prioritarias = set()
+
+    for item in dados:
+        if item["tag"] not in tags_prioritarias:
+            continue
+
+        texto = str(item.get("texto", "")).strip()
+        # Valor da tag precisa ser puramente numérico; sem capturar números
+        # embutidos em textos ou identificadores.
+        if not re.fullmatch(r"\d{1,12}", texto):
+            continue
+
+        numero = limpar_numero(texto)
+        if not numero or numero == "0":
+            continue
+
+        candidatos.append({
+            "numero": numero,
+            "metodo": f"tag:{item['tag']}",
+            "peso": 100
+        })
+
+    # Chave de acesso como alternativa apenas para NF-e modelo 55.
+    # Não tenta interpretar chaves no nome do arquivo como número de documento.
+    texto_xml = " ".join(item.get("texto", "") for item in dados)
+    chaves = encontrar_chaves(texto_xml)
+    chaves += encontrar_chaves(" ".join(
+        str(v) for elem in root.iter() for v in elem.attrib.values()
+    ))
+
+    chaves_validas = []
+    for chave in chaves:
+        if validar_chave_nfe(chave) and chave not in chaves_validas:
+            chaves_validas.append(chave)
 
     if tipo == "NF-e":
-
-        tags_prioritarias = [
-            "nNF",
-            "numeroNF",
-            "numNF",
-            "numero",
-            "Numero",
-            "numeroNota",
-            "NumeroNota",
-        ]
-
-    elif tipo == "NFS-e":
-
-        tags_prioritarias = [
-            "nNFSe",
-            "NumeroNfse",
-            "NumeroNFSe",
-            "numero",
-            "Numero",
-            "numeroNota",
-            "NumeroNota",
-        ]
-
-    else:
-
-        tags_prioritarias = []
-
-    for item in dados:
-
-        if item["tag"] in tags_prioritarias:
-
-            numero = limpar_numero(
-                item["texto"]
-            )
-
-            if numero:
-
-                candidatos.append({
-                    "numero": numero,
-                    "metodo": (
-                        f"tag:{item['tag']}"
-                    ),
-                    "peso": 100
-                })
-
-    # --------------------------------------------------------
-    # MÉTODO 2 — TAGS INDICATIVAS
-    # --------------------------------------------------------
-
-    palavras_numero = [
-        "nnf",
-        "nfse",
-        "numeronf",
-        "numeronota",
-        "numnf",
-        "numnota",
-        "notanumero",
-    ]
-
-    for item in dados:
-
-        tag_lower = (
-            item["tag"]
-            .lower()
-            .replace("_", "")
-        )
-
-        if any(
-            palavra in tag_lower
-            for palavra in palavras_numero
-        ):
-
-            numero = limpar_numero(
-                item["texto"]
-            )
-
-            if numero:
-
-                candidatos.append({
-                    "numero": numero,
-                    "metodo": (
-                        f"tag_indicativa:"
-                        f"{item['tag']}"
-                    ),
-                    "peso": 90
-                })
-
-    # --------------------------------------------------------
-    # MÉTODO 3 — CONTEXTO TEXTUAL
-    # --------------------------------------------------------
-
-    for item in dados:
-
-        texto = item["texto"]
-
-        padroes = [
-
-            r"(?:n[ºo°]?\s*\.?\s*"
-            r"(?:da\s*)?(?:nota|nf|nfe))"
-            r"\s*[:\-]?\s*(\d+)",
-
-            r"(?:nota\s*fiscal)"
-            r"\s*(?:n[ºo°]?)?"
-            r"\s*[:\-]?\s*(\d+)",
-
-            r"(?:n[ºo°]?\s*nfse)"
-            r"\s*[:\-]?\s*(\d+)",
-
-            r"(?:n[úu]mero)"
-            r"\s*(?:da\s*)?"
-            r"(?:nota|nf|nfse)"
-            r"\s*[:\-]?\s*(\d+)",
-        ]
-
-        for padrao in padroes:
-
-            m = re.search(
-                padrao,
-                texto,
-                re.IGNORECASE
-            )
-
-            if m:
-
-                numero = limpar_numero(
-                    m.group(1)
-                )
-
-                if numero:
-
-                    candidatos.append({
-                        "numero": numero,
-                        "metodo": "texto_contextual",
-                        "peso": 80
-                    })
-
-    # --------------------------------------------------------
-    # MÉTODO 4 — NOME DO ARQUIVO
-    # --------------------------------------------------------
-
-    nome = caminho_xml.name
-
-    padroes_nome = [
-
-        r"(?:NF|NFE|NFS|NFSE)"
-        r"[^\d]*(\d+)",
-
-        r"^(\d{1,12})",
-    ]
-
-    for padrao in padroes_nome:
-
-        m = re.search(
-            padrao,
-            nome,
-            re.IGNORECASE
-        )
-
-        if m:
-
-            numero = limpar_numero(
-                m.group(1)
-            )
-
-            if numero:
-
-                candidatos.append({
-                    "numero": numero,
-                    "metodo": "nome_arquivo",
-                    "peso": 60
-                })
-
-    # --------------------------------------------------------
-    # MÉTODO 5 — CHAVE DE ACESSO
-    # --------------------------------------------------------
-
-    # CORRIGIDO:
-    # anteriormente estava extrair_chaves()
-    # a função correta é encontrar_chaves()
-
-    texto_para_chaves = (
-        caminho_xml.stem
-        + " "
-        + " ".join(
-            item["texto"]
-            for item in dados
-        )
-    )
-
-    chaves = encontrar_chaves(
-        texto_para_chaves
-    )
-
-    for chave in chaves:
-
-        if (
-            tipo == "NF-e"
-            and validar_chave_nfe(chave)
-        ):
-
-            numero = numero_por_chave_nfe(
-                chave
-            )
-
-            if numero:
-
+        for chave in chaves_validas:
+            numero = numero_por_chave_nfe(chave)
+            if numero and numero != "0":
                 candidatos.append({
                     "numero": numero,
                     "metodo": "chave_acesso",
@@ -545,7 +384,6 @@ def candidatos_numero_xml(
                 })
 
     return candidatos
-
 
 def decidir_numero_xml(
     root,
@@ -1062,54 +900,31 @@ def extrair_texto_pdf(caminho):
 # ============================================================
 
 def extrair_numeros_pdf(texto):
+    """
+    Extrai números de PDF somente quando há rótulo textual explícito.
+    Não usa todos os números do documento, pois isso gera falsos candidatos.
+    """
+    if not texto:
+        return []
 
-    candidatos = []
-
+    texto_upper = str(texto).upper()
     padroes = [
-
-        r"(?:NF[\s\-]?e|NFe|NF)"
-        r"[^\d]{0,20}"
-        r"(\d{1,12})",
-
-        r"(?:NFS[\s\-]?e|NFSe|NFS)"
-        r"[^\d]{0,20}"
-        r"(\d{1,12})",
-
-        r"(?:Número|Numero|Nº|No)"
-        r"[^\d]{0,20}"
-        r"(\d{1,12})",
-
-        r"(?:Nota Fiscal)"
-        r"[^\d]{0,20}"
-        r"(\d{1,12})",
+        r"\bN[ÚU]MERO\s+(?:DA\s+)?NOTA(?:\s+FISCAL)?\s*[:#\-]?\s*(\d{1,12})\b",
+        r"\bN[ÚU]MERO\s+(?:DA\s+)?NFS[ -]?E\s*[:#\-]?\s*(\d{1,12})\b",
+        r"\bN[ÚU]MERO\s+NFSE\s*[:#\-]?\s*(\d{1,12})\b",
+        r"\bN[º°O]\s*(?:DA\s+)?NOTA(?:\s+FISCAL)?\s*[:#\-]?\s*(\d{1,12})\b",
+        r"\bN[º°O]\s*(?:DA\s+)?NFS[ -]?E\s*[:#\-]?\s*(\d{1,12})\b",
+        r"\bNFSE\s*(?:N[º°O]\s*)?[:#\-]\s*(\d{1,12})\b",
     ]
 
+    encontrados = []
     for padrao in padroes:
+        for match in re.finditer(padrao, texto_upper):
+            numero = limpar_numero(match.group(1))
+            if numero and numero != "0" and numero not in encontrados:
+                encontrados.append(numero)
 
-        for m in re.finditer(
-            padrao,
-            texto,
-            re.IGNORECASE
-        ):
-
-            numero = limpar_numero(
-                m.group(1)
-            )
-
-            if numero:
-
-                candidatos.append(
-                    numero
-                )
-
-    return sorted(
-        set(candidatos)
-    )
-
-
-# ============================================================
-# PDF — CNPJs
-# ============================================================
+    return encontrados
 
 def extrair_cnpjs_pdf(texto):
 
@@ -1494,38 +1309,33 @@ def processar_xml(
     )
 
     if resultado_cliente is None:
+        # V9: mesmo sem cliente cadastrado, tenta localizar o PDF correspondente.
+        # Isso ajuda a separar "documento encontrado" de "cliente identificado".
+        info_sem_cliente = {
+            "chave": chave,
+            "numero": numero,
+            "data": data,
+            "emit_cnpj": emit_cnpj,
+            "dest_cnpj": dest_cnpj
+        }
+        pdf_sem_cliente, metodo_pdf_sem_cliente = associar_pdf(
+            info_sem_cliente,
+            pdfs
+        )
 
         return {
-
-            "arquivo":
-                caminho_xml.name,
-
-            "tipo":
-                tipo,
-
-            "chave":
-                chave,
-
-            "numero":
-                numero,
-
-            "data":
-                data,
-
-            "emit_cnpj":
-                emit_cnpj,
-
-            "dest_cnpj":
-                dest_cnpj,
-
-            "status":
-                "REVISÃO",
-
-            "motivo":
-                "CNPJ do cliente não encontrado",
-
-            "candidatos_numero":
-                candidatos_numero
+            "arquivo": caminho_xml.name,
+            "tipo": tipo,
+            "chave": chave,
+            "numero": numero,
+            "data": data,
+            "emit_cnpj": emit_cnpj,
+            "dest_cnpj": dest_cnpj,
+            "pdf": pdf_sem_cliente,
+            "metodo_pdf": metodo_pdf_sem_cliente,
+            "status": "REVISÃO",
+            "motivo": "CNPJ do cliente não encontrado no banco.xlsx; associação de PDF não autoriza movimentação",
+            "candidatos_numero": candidatos_numero
         }
 
     if resultado_cliente[0] == "AMBIGUO":
@@ -1982,7 +1792,7 @@ def main():
 
     print(
         " PROCESSADOR XML + PDF "
-        "NF-e / NFS-e - V8"
+        "NF-e / NFS-e - V9"
     )
 
     print(
@@ -2135,7 +1945,7 @@ def main():
     ) as f:
 
         f.write(
-            "RELATÓRIO DE SIMULAÇÃO - V8\n"
+            "RELATÓRIO DE SIMULAÇÃO - V9\n"
         )
 
         f.write(
